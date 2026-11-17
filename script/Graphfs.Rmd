@@ -1,0 +1,3072 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-03-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{python}
+
+import os
+import math
+import requests
+import pandas as pd
+from typing import List, Dict, Optional
+
+
+BASE_URL = "https://data.mo.gov"
+DATASET_ID = "hcm8-fbau"  # CNA-Approved-Facility-Training-Agencies
+
+def fetch_socrata_dataset(
+    dataset_id: str,
+    base_url: str = BASE_URL,
+    app_token: Optional[str] = None,
+    limit: int = 50000,        # SODA allows large page sizes; adjust if needed
+    where: Optional[str] = None,
+    select: Optional[str] = None,
+    order: Optional[str] = None
+) -> List[Dict]:
+    """
+    Fetch all rows from a Socrata dataset using pagination.
+    Returns a list of JSON records (dicts).
+    """
+    session = requests.Session()
+    headers = {}
+    if app_token:
+        headers["X-App-Token"] = app_token
+
+    resource_url = f"{base_url}/resource/{dataset_id}.json"
+    rows: List[Dict] = []
+    offset = 0
+
+    while True:
+        params = {"$limit": limit, "$offset": offset}
+        if where:  params["$where"]  = where
+        if select: params["$select"] = select
+        if order:  params["$order"]  = order
+
+        resp = session.get(resource_url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        batch = resp.json()
+
+        if not batch:
+            break
+
+        rows.extend(batch)
+        # Stop when the returned batch is smaller than the page size
+        if len(batch) < limit:
+            break
+
+        offset += limit
+
+    return rows
+
+def to_dataframe(rows: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    # Optional: normalize common date/number fields if present
+    # Example:
+    # if "approval_date" in df:
+    #     df["approval_date"] = pd.to_datetime(df["approval_date"], errors="coerce")
+    return df
+
+def main():
+    # Optional: set an app token to raise rate limits (create one in your Socrata account)
+    app_token = os.getenv("SOCRATA_APP_TOKEN", None)
+
+    # Example filters (uncomment and adjust once you know field names)
+    # where = "city = 'Jefferson City'"
+    # select = "agency_name, city, county, approval_date"
+    # order  = "agency_name"
+
+    rows = fetch_socrata_dataset(
+        DATASET_ID,
+        app_token=app_token,
+        # where=where,
+        # select=select,
+        # order=order,
+    )
+
+    df = to_dataframe(rows)
+
+    # Preview
+    print(f"Total rows: {len(df)}")
+    print(df.head(10))
+
+    # Save outputs
+    csv_path = "C:/Users/urbonn/Documents/Analysis frequent customes/temp/cna_approved_training_agencies.csv"
+    xlsx_path = "C:/Users/urbonn/Documents/Analysis frequent customes/temp/cna_approved_training_agencies.xlsx"
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    # Excel writer requires openpyxl installed
+  #  with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+   #     df.to_excel(writer, index=False, sheet_name="agencies")
+
+with pd.ExcelWriter("output.xlsx", engine="openpyxl", mode="w") as writer:
+    df.to_excel(writer, sheet_name="Sheet1", index=False)
+    wb = writer.book
+    for ws in wb.worksheets:
+        ws.sheet_state = "visible"
+    wb.active = 0
+
+    print(f"Saved: {csv_path}")
+    print(f"Saved: {xlsx_path}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```{python}
+
+
+import re
+import json
+import time
+from pathlib import Path
+from typing import List, Tuple, Optional
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from tqdm import tqdm
+
+# ----------------------------
+# Configuration
+# ----------------------------
+BASE_URL = "https://montanaworks.gov"
+START_URL = "https://montanaworks.gov/training"
+OUTPUT_DIR = Path("C:/Users/urbonn/Documents/Analysis frequent customes/temp/")
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0 Safari/537.36 Nan-WIOA-ETPL-Fetcher"
+})
+REQUEST_TIMEOUT = 20
+DELAY_SECONDS = 1.0
+DOWNLOAD_EXTS = {".csv", ".xlsx", ".xls", ".json", ".pdf"}
+
+# Terms used to identify relevant links
+TEXT_TERMS = [
+    "wioa",
+    "eligible training provider",
+    "eligible training providers",
+    "etpl",
+]
+URL_TERMS = [
+    "wioa", "etpl", "eligible-training", "eligible_training",
+]
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def ensure_output() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def clean_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-.]+", "_", name).strip("_")
+    return name[:150] or "file"
+
+def get_html(url: str) -> BeautifulSoup:
+    """
+    Basic HTML fetch using requests, with a polite delay and error handling.
+    """
+    time.sleep(DELAY_SECONDS)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+def score_link(a_tag, page_url: str) -> Tuple[int, str]:
+    """
+    Score a link by relevance to WIOA ETPL.
+    Returns (score, absolute_url).
+    """
+    href = a_tag.get("href")
+    text = a_tag.get_text(" ", strip=True)
+    if not href:
+        return (0, "")
+
+    abs_url = urljoin(page_url, href)
+    score = 0
+    txt = (text or "").lower()
+    url_lower = abs_url.lower()
+
+    # Text signals
+    for term in TEXT_TERMS:
+        if term in txt:
+            score += 5
+
+    # URL signals
+    for term in URL_TERMS:
+        if term in url_lower:
+            score += 3
+
+    # Prefer direct data files
+    ext = Path(urlparse(abs_url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        score += 2
+
+    # Prefer staying within /training
+    if urlparse(abs_url).path.startswith("/training"):
+        score += 1
+
+    return (score, abs_url)
+
+def find_candidate_links(soup: BeautifulSoup, page_url: str) -> List[Tuple[int, str, str]]:
+    """
+    Return a list of (score, url, link_text), sorted by score(desc).
+    """
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        score, abs_url = score_link(a, page_url)
+        if score > 0:
+            candidates.append((score, abs_url, a.get_text(" ", strip=True)))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates
+
+def download_file(url: str, filename_hint: Optional[str] = None) -> Optional[Path]:
+    """
+    Download a file to OUTPUT_DIR and return the saved path.
+    """
+    parsed = urlparse(url)
+    ext = Path(parsed.path).suffix.lower()
+    fname = filename_hint or Path(parsed.path).name or "download"
+    if ext and not fname.lower().endswith(ext):
+        fname += ext
+    fname = clean_filename(fname)
+    out_path = OUTPUT_DIR / fname
+
+    with SESSION.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        chunk = 1024 * 64
+        with open(out_path, "wb") as f, tqdm(
+            total=total if total > 0 else None,
+            unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"Downloading {fname}",
+            leave=False
+        ) as pbar:
+            for c in r.iter_content(chunk_size=chunk):
+                if c:
+                    f.write(c)
+                    if total > 0:
+                        pbar.update(len(c))
+    print(f"✔ Saved file: {out_path}")
+    return out_path
+
+def save_tables_from_page(soup: BeautifulSoup, page_url: str) -> int:
+    """
+    Extract any HTML tables on the page and save as CSV.
+    """
+    html = str(soup)
+    try:
+        tables = pd.read_html(html)
+    except ValueError:
+        tables = []
+
+    if not tables:
+        return 0
+
+    slug = clean_filename(Path(urlparse(page_url).path).name or "training")
+    count = 0
+    for i, df in enumerate(tables, start=1):
+        out_path = OUTPUT_DIR / f"{slug}_table_{i}.csv"
+        df.to_csv(out_path, index=False)
+        count += 1
+    print(f"✔ Extracted {count} table(s) from {page_url}")
+    return count
+
+def process_candidate(url: str, link_text: str) -> None:
+    """
+    If candidate is a direct file -> download
+    Else -> open the page, try to extract tables and find file links.
+    """
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        download_file(url, filename_hint=link_text or Path(urlparse(url).path).name)
+        return
+
+    # Not a direct file: open the page
+    try:
+        soup = get_html(url)
+    except requests.RequestException as e:
+        print(f"❌ Failed to open {url}: {e}")
+        return
+
+    # Try tables first
+    saved_tables = save_tables_from_page(soup, url)
+
+    # Also search on this page for more direct file links
+    file_links = []
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a["href"])
+        ext2 = Path(urlparse(href).path).suffix.lower()
+        if ext2 in DOWNLOAD_EXTS:
+            text2 = a.get_text(" ", strip=True) or Path(urlparse(href).path).name
+            score = 0
+            t2 = (text2 or "").lower()
+            for term in TEXT_TERMS:
+                if term in t2:
+                    score += 3
+            file_links.append((score, href, text2))
+
+    file_links.sort(key=lambda x: x[0], reverse=True)
+
+    for _, href, text2 in file_links:
+        try:
+            download_file(href, filename_hint=text2)
+        except requests.RequestException as e:
+            print(f"❌ Failed to download {href}: {e}")
+
+    if saved_tables == 0 and not file_links:
+        print(f"ℹ No tables or data files found on {url}. "
+              f"If the page is JavaScript-rendered, use the Selenium variant.")
+
+def find_wioa_etpl() -> None:
+    ensure_output()
+
+    # Load the training start page
+    try:
+        soup = get_html(START_URL)
+    except requests.RequestException as e:
+        print(f"❌ Failed to open {START_URL}: {e}")
+        return
+
+    # Find candidate links on the training page
+    candidates = find_candidate_links(soup, START_URL)
+
+    if not candidates:
+        print("⚠ No links mentioning WIOA/ETPL found on the training page.")
+    else:
+        print("🔎 Candidate links (top 10):")
+        for i, (score, url, text) in enumerate(candidates[:10], start=1):
+            print(f"  {i}. score={score} | text='{text}' | url={url}")
+
+    # Process the best candidate
+    if candidates:
+        best_score, best_url, best_text = candidates[0]
+        print(f"\n➡ Processing best match: score={best_score}, text='{best_text}', url={best_url}\n")
+        process_candidate(best_url, best_text)
+
+    # Manifest
+    manifest = {"start_url": START_URL}
+    with open(OUTPUT_DIR / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"📒 Wrote manifest to {OUTPUT_DIR / 'manifest.json'}")
+    print("✅ Done.")
+
+if __name__ == "__main__":
+    find_wioa_etpl()
+
+
+
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+
+def get_html(url: str) -> BeautifulSoup:
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    try:
+        driver.get(url)
+        time.sleep(2.5)  # allow JS to render
+        html = driver.page_source
+        return BeautifulSoup(html, "lxml")
+    finally:
+        driver.quit()
+
+```
+
+```{python}
+import time
+import re
+from pathlib import Path
+from typing import List, Tuple, Optional
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+
+
+from datetime import datetime
+import shutil
+
+# Standard export names (date-stamped)
+RUN_DATE = datetime.now().strftime("%Y-%m-%d")
+EXPORT_CSV = f"WIOA_ETPL_Montana_{RUN_DATE}.csv"
+EXPORT_XLSX = f"WIOA_ETPL_Montana_{RUN_DATE}.xlsx"
+
+def export_dataframe(df: pd.DataFrame) -> Path:
+    """Export the combined dataframe to CSV (and optionally Excel) in OUTPUT_DIR."""
+    out_csv = OUTPUT_DIR / EXPORT_CSV
+    df.to_csv(out_csv, index=False)
+    print(f"📄 Exported combined CSV: {out_csv}")
+
+    # Optional: also write Excel (requires XlsxWriter)
+    try:
+        with pd.ExcelWriter(OUTPUT_DIR / EXPORT_XLSX, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="ETPL", index=False)
+        print(f"📊 Exported Excel: {OUTPUT_DIR / EXPORT_XLSX}")
+    except Exception as e:
+        # Don’t fail the run because Excel export failed
+        print(f"ℹ Skipped Excel export (install 'XlsxWriter' to enable). Reason: {e}")
+
+    return out_csv
+
+def read_file_as_dataframe(file_path: Path) -> pd.DataFrame:
+    """Try reading a downloaded file as a dataframe (CSV/XLSX)."""
+    ext = file_path.suffix.lower()
+    if ext == ".csv":
+        return pd.read_csv(file_path)
+    if ext in {".xlsx", ".xls"}:
+        return pd.read_excel(file_path)
+    raise ValueError(f"Unsupported format for DataFrame conversion: {ext}")
+
+
+# --------------------------------
+# Config
+# --------------------------------
+START_URL = "https://montanaworks.gov/training"
+OUTPUT_DIR = Path("C:/Users/urbonn/Documents/Analysis frequent customes/temp/")
+TPUT_DIR = Path("C:/Users/urbonn/Documents/Analysis frequent customes/temp/")
+REQUEST_TIMEOUT = 20
+DELAY_SECONDS = 1.0
+DOWNLOAD_EXTS = {".csv", ".xlsx", ".xls", ".json", ".pdf"}
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0 Safari/537.36 Nan-WIOA-ETPL-Fetcher"
+})
+
+TEXT_TERMS = ["wioa", "eligible training provider", "eligible training providers", "etpl"]
+URL_TERMS  = ["wioa", "etpl", "eligible-training", "eligible_training"]
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def ensure_output() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def clean_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-.]+", "_", name).strip("_")
+    return name[:150] or "file"
+
+def get_html(url: str) -> BeautifulSoup:
+    """Fetch HTML and return BeautifulSoup object."""
+    time.sleep(DELAY_SECONDS)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+def score_link(a_tag, page_url: str) -> Tuple[int, str]:
+    href = a_tag.get("href")
+    text = a_tag.get_text(" ", strip=True)
+    if not href:
+        return (0, "")
+    abs_url = urljoin(page_url, href)
+    score = 0
+    txt = (text or "").lower()
+    url_lower = abs_url.lower()
+
+    for term in TEXT_TERMS:
+        if term in txt:
+            score += 5
+    for term in URL_TERMS:
+        if term in url_lower:
+            score += 3
+
+    ext = Path(urlparse(abs_url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        score += 2
+    if urlparse(abs_url).path.startswith("/training"):
+        score += 1
+
+    return (score, abs_url)
+
+def find_candidate_links(soup: BeautifulSoup, page_url: str) -> List[Tuple[int, str, str]]:
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        score, abs_url = score_link(a, page_url)
+        if score > 0:
+            candidates.append((score, abs_url, a.get_text(" ", strip=True)))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates
+
+def download_file(url: str, filename_hint: Optional[str] = None) -> Path:
+    """Download a file to OUTPUT_DIR; if CSV/XLSX, also export to the standard name."""
+    parsed = urlparse(url)
+    ext = Path(parsed.path).suffix.lower()
+    fname = filename_hint or Path(parsed.path).name or "download"
+    if ext and not fname.lower().endswith(ext):
+        fname += ext
+    saved_path = OUTPUT_DIR / clean_filename(fname)
+
+    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    with open(saved_path, "wb") as f:
+        f.write(r.content)
+    print(f"✔ Saved file: {saved_path}")
+
+    # If it’s a CSV/XLSX, also produce a standard export file
+    try:
+        if ext in {".csv", ".xlsx", ".xls"}:
+            df = read_file_as_dataframe(saved_path)
+            export_dataframe(df)
+    except Exception as e:
+        print(f"ℹ Could not create standardized export from {saved_path}: {e}")
+
+    return saved_path
+
+def save_tables_from_page(soup: BeautifulSoup, page_url: str) -> int:
+    """Extract HTML tables on the page, save individual CSVs, and export a combined CSV."""
+    try:
+        tables = pd.read_html(str(soup))
+    except ValueError:
+        tables = []
+
+    if not tables:
+        return 0
+
+    slug = clean_filename(Path(urlparse(page_url).path).name or "training")
+    combined = []
+    count = 0
+    for i, df in enumerate(tables, start=1):
+        out_path = OUTPUT_DIR / f"{slug}_table_{i}.csv"
+        df.to_csv(out_path, index=False)
+        combined.append(df)
+        count += 1
+
+    print(f"✔ Extracted {count} table(s) from {page_url}")
+
+    # Export a combined file (stack rows; align columns by name)
+    try:
+        combined_df = pd.concat(combined, ignore_index=True)
+        export_dataframe(combined_df)
+    except Exception as e:
+        print(f"ℹ Could not combine tables: {e}")
+
+    return count
+
+def process_candidate(url: str, link_text: str) -> None:
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        download_file(url, filename_hint=link_text or Path(urlparse(url).path).name)
+        return
+
+    try:
+        soup = get_html(url)
+    except requests.RequestException as e:
+        print(f"❌ Failed to open {url}: {e}")
+        return
+
+    saved_tables = save_tables_from_page(soup, url)
+
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a["href"])
+        text2 = a.get_text(" ", strip=True) or Path(urlparse(href).path).name
+        ext2 = Path(urlparse(href).path).suffix.lower()
+        if ext2 in DOWNLOAD_EXTS:
+            try:
+                download_file(href, filename_hint=text2)
+            except requests.RequestException as e:
+                print(f"❌ Failed to download {href}: {e}")
+
+    if saved_tables == 0:
+        print(f"ℹ No tables found on {url}. If content is JS-rendered, use Selenium.")
+
+# --------------------------------
+# Main
+# --------------------------------
+def find_wioa_etpl() -> None:
+    ensure_output()
+    soup = get_html(START_URL)
+    candidates = find_candidate_links(soup, START_URL)
+    if not candidates:
+        print("⚠ No candidate links mentioning WIOA/ETPL found on the training page.")
+        return
+
+    print("🔎 Candidate links (top 10):")
+    for i, (score, url, text) in enumerate(candidates[:10], start=1):
+        print(f"  {i}. score={score} | text='{text}' | url={url}")
+
+    best_score, best_url, best_text = candidates[0]
+    print(f"\n➡ Processing best match: score={best_score}, text='{best_text}', url={best_url}\n")
+    process_candidate(best_url, best_text)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+```{python}
+
+
+import os
+import re
+import json
+import time
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from tqdm import tqdm
+from urllib.parse import urljoin, urlparse
+
+BASE_URL = "https://montanaworks.gov"
+START_URL = "https://montanaworks.gov/training"
+OUTPUT_DIR = Path("montanaworks_wioa_etpl")
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0 Safari/537.36 Nan-WIOA-ETPL-Fetcher"
+})
+
+REQUEST_TIMEOUT = 20
+DELAY_SECONDS = 1.0
+
+DOWNLOAD_EXTS = {".csv", ".xlsx", ".xls", ".json", ".pdf"}
+
+# Terms we consider as signals for the ETPL/WIOA list
+TEXT_TERMS = [
+    "wioa",
+    "eligible training provider",
+    "eligible training provider list",
+    "etpl"
+]
+URL_TERMS = [
+    "wioa", "etpl", "eligible-training", "eligible_training"
+]
+
+
+def ensure_output():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clean_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-.]+", "_", name).strip("_")
+    return name[:150] or "file"
+
+
+
+def get_html(url: str) -> BeautifulSoup:
+    """
+    Basic HTML fetch using requests, with a polite delay and error handling.
+    """
+    time.sleep(DELAY_SECONDS)
+    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "lxml")
+
+
+
+def score_link(a_tag, page_url: str) -> Tuple[int, str]:
+    """
+    Score a candidate link for relevance to WIOA ETPL.
+    Higher score means more likely to be the list we want.
+    Returns (score, absolute_url)
+    """
+    href = a_tag.get("href")
+    text = a_tag.get_text(" ", strip=True)
+    if not href:
+        return (0, "")
+    abs_url = urljoin(page_url, href)
+
+    score = 0
+    txt = (text or "").lower()
+    url_lower = abs_url.lower()
+
+    # Text signals
+    for term in TEXT_TERMS:
+        if term in txt:
+            score += 5
+
+    # URL signals
+    for term in URL_TERMS:
+        if term in url_lower:
+            score += 3
+
+    # Prefer direct data files
+    ext = Path(urlparse(abs_url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        score += 2
+
+    # Prefer staying within /training
+    if urlparse(abs_url).path.startswith("/training"):
+        score += 1
+
+    return (score, abs_url)
+
+
+def find_candidate_links(soup: BeautifulSoup, page_url: str) -> List[Tuple[int, str, str]]:
+    """
+    Return a list of (score, url, link_text), sorted by score(desc).
+    """
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        score, abs_url = score_link(a, page_url)
+        if score > 0:
+            candidates.append((score, abs_url, a.get_text(" ", strip=True)))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates
+
+
+def download_file(url: str, filename_hint: Optional[str] = None) -> Optional[Path]:
+    """
+    Download file to OUTPUT_DIR and return the saved path.
+    """
+    parsed = urlparse(url)
+    ext = Path(parsed.path).suffix.lower()
+    fname = filename_hint or Path(parsed.path).name or "download"
+    if ext and not fname.lower().endswith(ext):
+        fname += ext
+    fname = clean_filename(fname)
+    out_path = OUTPUT_DIR / fname
+
+    with SESSION.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        chunk = 1024 * 64
+        with open(out_path, "wb") as f, tqdm(
+            total=total if total > 0 else None,
+            unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"Downloading {fname}",
+            leave=False
+        ) as pbar:
+            for c in r.iter_content(chunk_size=chunk):
+                if c:
+                    f.write(c)
+                    if total > 0:
+                        pbar.update(len(c))
+    print(f"✔ Saved file: {out_path}")
+    return out_path
+
+
+def save_tables_from_page(soup: BeautifulSoup, page_url: str) -> int:
+    """
+    Extract HTML tables on the page and save as CSV into OUTPUT_DIR.
+    """
+    html = str(soup)
+    try:
+        tables = pd.read_html(html)
+    except ValueError:
+        tables = []
+
+    if not tables:
+        return 0
+
+    slug = clean_filename(Path(urlparse(page_url).path).name or "training")
+    count = 0
+    for i, df in enumerate(tables, start=1):
+        out_path = OUTPUT_DIR / f"{slug}_table_{i}.csv"
+        df.to_csv(out_path, index=False)
+        count += 1
+    print(f"✔ Extracted {count} table(s) from {page_url}")
+    return count
+
+
+def process_candidate(url: str, link_text: str) -> None:
+    """
+    If candidate is a direct file -> download
+    Else -> open page and try to find tables or more specific download links
+    """
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in DOWNLOAD_EXTS:
+        download_file(url, filename_hint=link_text or Path(urlparse(url).path).name)
+        return
+
+    # Not a direct file: open the page
+    try:
+        soup = get_html(url)
+    except requests.RequestException as e:
+        print(f"❌ Failed to open {url}: {e}")
+        return
+
+    # Try tables first
+    saved_tables = save_tables_from_page(soup, url)
+
+    # Also search on this page for more direct file links
+    file_links = []
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a["href"])
+        ext2 = Path(urlparse(href).path).suffix.lower()
+        if ext2 in DOWNLOAD_EXTS:
+            text2 = a.get_text(" ", strip=True) or Path(urlparse(href).path).name
+            # Give preference if the text contains our ETPL terms
+            score = 0
+            t2 = text2.lower()
+            for term in TEXT_TERMS:
+                if term in t2:
+                    score += 3
+            file_links.append((score, href, text2))
+
+    file_links.sort(key=lambda x: x[0], reverse=True)
+
+    for _, href, text2 in file_links:
+        try:
+            download_file(href, filename_hint=text2)
+        except requests.RequestException as e:
+            print(f"❌ Failed to download {href}: {e}")
+
+    if saved_tables == 0 and not file_links:
+        print(f"ℹ No tables or data files found on {url}. "
+              f"Try the Selenium option if content is JS-rendered.")
+
+
+def find_wioa_etpl():
+    ensure_output()
+
+    # Load the training start page
+    try:
+        soup = get_html(START_URL)
+    except requests.RequestException as e:
+        print(f"❌ Failed to open {START_URL}: {e}")
+        return
+
+    # Find candidate links on the training page
+    candidates = find_candidate_links(soup, START_URL)
+
+    if not candidates:
+        print("⚠ No candidate links mentioning WIOA/ETPL found on the training page.")
+    else:
+        print("🔎 Candidate links (top 10 shown):")
+        for i, (score, url, text) in enumerate(candidates[:10], start=1):
+            print(f"  {i}. score={score} | text='{text}' | url={url}")
+
+    # Pick the best candidate and process it
+    if candidates:
+        best_score, best_url, best_text = candidates[0]
+        print(f"\n➡ Processing best match: score={best_score}, text='{best_text}', url={best_url}\n")
+        process_candidate(best_url, best_text)
+
+    # Save a small manifest
+    manifest = {
+        "start_url": START_URL,
+    }
+    with open(OUTPUT_DIR / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"📒 Wrote manifest to {OUTPUT_DIR / 'manifest.json'}")
+    print("✅ Done.")
+
+
+if __name__ == "__main__":
+    find_wioa_etpl()
+
+
+
+```
+
+```{python}
+
+# Only needed if requests/BeautifulSoup didn't find what you expect.
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import time
+
+def get_html_via_selenium(url: str) -> Tuple[str, BeautifulSoup]:
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    try:
+        driver.get(url)
+        time.sleep(2.5)  # allow JS to render; tune if needed
+        html = driver.page_source
+        soup = BeautifulSoup(html, "lxml")
+        return html, soup
+    finally:
+        driver.quit()
+
+
+```
+
+# Training Enrollment Rate Over Time
+```{r}
+
+# Load libraries
+library(tidyverse)
+
+# ---- 1) Enter the data ----
+df <- tribble(
+  ~PY,    ~Single_Total, ~Single_Training, ~Repeat_Total, ~Repeat_Training,
+# "PY 2017",     1815,           953,              81,               37,
+  "PY 2018",     3687,          1983,             150,               95,
+  "PY 2019",     3492,          1865,             148,               72,
+  "PY 2020",     3585,          1909,             149,               78,
+  "PY 2021",     6017,          1906,             251,               71,
+  "PY 2022",     5823,          1421,             249,               69,
+  "PY 2023",     4367,          1112,             214,               36,
+  "PY 2024",     2898,          1147,             147,               68
+) %>%
+  mutate(Year = as.integer(stringr::str_remove(PY, "PY")))
+
+# ---- 2) Compute enrollment rates ----
+df_rates <- df %>%
+  pivot_longer(
+    cols = c(Single_Total, Single_Training, Repeat_Total, Repeat_Training),
+    names_to = c("Cohort", ".value"),
+    names_pattern = "(Single|Repeat)_(Total|Training)"
+  ) %>%
+  mutate(
+    Cohort = dplyr::recode(Cohort,
+                    "Single" = "Single",
+                    "Repeat" = "Repeat"),
+    EnrollRate = Training / Total
+  )
+
+
+# ---- 3) Plot A: Time series of enrollment rates with a smooth fit ----
+p_rate <- ggplot(df_rates, aes(x = Year, y = EnrollRate, color = Cohort)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_smooth(method = "loess", se = TRUE, 
+              #span = 0.8, 
+              linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = df_rates$Year) +
+  scale_color_manual(
+    values = c(
+      "Single" = "#8ad4df",
+      "Repeat" = "#09527d"
+    )
+  ) +
+  labs(
+    title = "Training Enrollment Rate Over Time",
+    subtitle = "Single vs. Repeat (PY 2018 – PY 2024)",
+    x = "Program Year",
+    y = " Training Enrollment Rate",
+    color = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)+
+   theme( plot.title = element_text(hjust = 0.5),    # Centers the title
+    plot.subtitle = element_text(hjust = 0.5) )
+
+
+print(p_rate)
+
+# ---- 4) Plot B: Relationship between Total Participants and Training Enrolled ----
+# Scatter with linear fit per cohort
+p_scatter <- ggplot(df_rates, aes(x = Total, y = Total, color = Cohort)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(
+    title = "Training Enrolled vs. Total Participants",
+    subtitle = "Linear fit by cohort",
+    x = "Total Participants",
+    y = "Training Enrolled",
+    color = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_scatter)
+
+# ---- 5) (Optional) Quick linear trend checks for reporting ----
+# Rate ~ Year per cohort
+trend_summary <- df_rates %>%
+  group_by(Cohort) %>%
+  do({
+    m <- lm(EnrollRate ~ Year, data = .)
+    broom::tidy(m)
+  })
+
+print(trend_summary)
+
+# ---- 6) (Optional) Save figures ----
+# ggsave("enrollment_rate_timeseries.png", p_rate, width = 8, height = 4.5, dpi = 300)
+# ggsave("enrolled_vs_total_scatter.png", p_scatter, width = 7, height = 4.5, dpi = 300)
+```
+
+# Age Time series
+
+```{r}
+
+df_wide <- tribble(
+  ~PY,      ~Once_Age, ~Repeat_Age,
+ "PY2017", 31.7749,    30.81081,
+  "PY2018", 31.88169,   29.78947,
+  "PY2019", 33.92324,   29.54944,
+  "PY2020", 33.32679,   33.29487,
+  "PY2021", 31.78004,   31.01389,
+  "PY2022", 31.98210,   34.15493,
+  "PY2023", 32.65911,   34.69118,
+  "PY2024", 32.65911,   35.02941
+) %>%
+  mutate(Year = as.integer(str_remove(PY, "PY")))
+
+# Overall cohort means (from your table)
+overall_means <- tribble(
+  ~Cohort,              ~AvgAge,
+  "Single",        32.53,
+  "Repeat", 31.54
+)
+
+# Under-25 proportions (from your table)
+under25 <- tribble(
+  ~Cohort,              ~Under25_Count, ~Total_Count,
+  "Single",        3859,           10515,
+  "Repeat", 188,            441
+) %>%
+  mutate(Under25_Rate = Under25_Count / Total_Count)
+
+# ==== 2) Pivot to long format for ggplot ====
+df_long <- df_wide %>%
+  pivot_longer(
+    cols = c(Once_Age, Repeat_Age),
+    names_to = "Cohort",
+    values_to = "AvgAge"
+  ) %>%
+  mutate(Cohort = recode(Cohort,
+                         "Once_Age"   = "Single",
+                         "Repeat_Age" = "Repeat"))
+
+# ==== 3) Plot A: Time series of average age with LOESS fit ====
+p_age_ts <- ggplot(df_long, aes(x = Year, y = AvgAge, color = Cohort)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  # LOESS smoother + confidence band
+  geom_smooth(method = "loess", se = TRUE, span = 0.8, linetype = "dashed") +
+  scale_x_continuous(breaks = unique(df_long$Year)) +
+  scale_color_manual(values = c("Single" = "#1280bf",
+                                "Repeat" = "#09527d")) +
+  labs(
+    title = "Average Age Over Time (PY2017–PY2024)",
+    subtitle = "LOESS fit highlights trend differences between cohorts",
+    x = "Year",
+    y = "Average Age (years)",
+    color = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_age_ts)
+
+
+```
+
+# Age Gap Curve
+
+```{r}
+
+library(tidyverse)
+
+df_wide <- tribble(
+  ~PY,      ~Once_Age, ~Repeat_Age,
+  "PY2017", 31.7749,    30.81081,
+  "PY2018", 31.88169,   29.78947,
+  "PY2019", 33.92324,   29.54944,
+  "PY2020", 33.32679,   33.29487,
+  "PY2021", 31.78004,   31.01389,
+  "PY2022", 31.98210,   34.15493,
+  "PY2023", 32.65911,   34.69118,
+  "PY2024", 32.65911,   35.02941
+) %>% mutate(Year = as.integer(str_remove(PY, "PY")))
+
+df_gap <- df_wide %>%
+  transmute(Year, Age_Gap = Once_Age - Repeat_Age)
+
+ggplot(df_gap, aes(x = Year, y = Age_Gap)) +
+  geom_hline(yintercept = 0, color = "grey60", linetype = "dotted") +
+  geom_line(color = "#1280bf", size = 1) +
+  geom_point(color = "#09527d", size = 2) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.8, linetype = "dashed", color = "#1280bf") +
+  scale_x_continuous(breaks = df_gap$Year) +
+  labs(
+    title = "Age Gap Over Time (Single – Repeat)",
+    subtitle = "Positive values: Single older; Negative values: Repeat older",
+    x = "Year",
+    y = "Age Gap (years)"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+## Age Under 25 year old
+
+```{r}
+under25 <- tribble(
+  ~Cohort,              ~Under25_Count, ~Total_Count,
+  "Single",        3859,           10515,   # 36.7% if counts are correct
+  "Repeat", 188,            441      # 42.6%
+) %>%
+  mutate(Under25_Rate = Under25_Count / Total_Count)
+
+ggplot(under25, aes(x = Cohort, y = Under25_Rate, fill = Cohort)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = scales::percent(Under25_Rate, accuracy = 0.1)),
+            vjust = -0.6, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, max(under25$Under25_Rate) * 1.15)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  guides(fill = "none") +
+  labs(
+    title = "Under-25 Share by Cohort",
+    subtitle = "Composition differences can drive mean age trends",
+    x = NULL, y = "Under-25 Rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+# Age Compasition By cohort
+
+```{r}
+library(tidyverse)
+
+# ---- 1) Age band counts and shares ----
+age_counts <- tribble(
+  ~Cohort,              ~AgeBand,   ~Count, ~Total,
+  "Single",        "Under 21", 2329,    10515,
+  "Single",        "22 ~ 30",    3069,    10515,
+  "Single",        "31 ~ 54",    4548,    10515,
+  "Single",        "Above 55", 569,     10515,
+  "Repeat", "Under 21", 101,     441,
+  "Repeat", "22 ~ 30",    154,     441,
+  "Repeat", "31 ~ 54",    163,     441,
+  "Repeat", "Above 55", 23,      441
+) %>%
+  mutate(Share = Count / Total)
+
+# ---- 2) Under-25 summary ----
+under25 <- tribble(
+  ~Cohort,              ~Under25, ~Total,
+  "Single",        3859,     10515,
+  "Repeat", 188,      441
+) %>%
+  mutate(Rate = Under25 / Total)
+
+# ---- 3) Mean age ----
+means <- tribble(
+  ~Cohort,              ~AvgAge,
+  "Single",        32.53,
+  "Repeat", 31.54
+)
+
+# ---- Plot A: Age composition by cohort (stacked % bars) ----
+p_comp <- ggplot(age_counts, aes(x = Cohort, y = Share, fill = AgeBand)) +
+  geom_col(width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Age Composition by Cohort",
+    subtitle = "Shares of each age  within Single vs Repeat",
+    x = NULL, y = "Share of cohort", fill = "Age "
+  ) +
+  theme_minimal(base_size = 12)+
+   theme( plot.title = element_text(hjust = 0.5),    # Centers the title
+    plot.subtitle = element_text(hjust = 0.5) )
+print(p_comp)
+
+# ---- Plot B: Age band shares by cohort (side-by-side) ----
+age_counts$AgeBand <- 
+  factor(age_counts$AgeBand, levels = c("Under 21", "22 ~ 30", "31 ~ 54", "Above 55"))
+p_comp2 <- ggplot(age_counts, aes(x = AgeBand, y = Share, fill = Cohort)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  labs(
+    title = "Age Distribution by Cohort",
+#    subtitle = "Side-by-side comparison across age bands",
+    x = "Age", y = "", fill = "Cohort"
+  ) +theme_minimal(base_size = 12)+
+  theme( plot.title = element_text(hjust = 0.5)    # Centers the title
+ #   plot.subtitle = element_text(hjust = 0.5) 
+    )
+  
+
+print(p_comp2)
+
+# ---- Plot C: Under-25 rate by cohort ----
+p_u25 <- ggplot(under25, aes(x = Cohort, y = Rate, fill = Cohort)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = scales::percent(Rate, accuracy = 0.1)),
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, max(under25$Rate) * 1.15)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  guides(fill = "none") +
+  labs(
+    title = "Under-25 Share by Cohort",
+    subtitle = "Proportion of participants under age 25",
+    x = NULL, y = "Under-25 rate"
+  ) +
+  theme_minimal(base_size = 12)+
+  theme( plot.title = element_text(hjust = 0.5),    # Centers the title
+    plot.subtitle = element_text(hjust = 0.5) )
+
+print(p_u25)
+
+# ---- Plot D: Average age by cohort ----
+p_mean <- ggplot(means, aes(x = Cohort, y = AvgAge, fill = Cohort)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", AvgAge)), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  guides(fill = "none") +
+  labs(
+    title = "Average Age by Cohort",
+    x = NULL, y = "Average Age (years)"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_mean)
+
+# ---- (Optional) Chi-square test: Are age distributions different? ----
+chisq_input <- age_counts %>%
+  select(AgeBand, Cohort, Count) %>%
+  pivot_wider(names_from = Cohort, values_from = Count) %>%
+  column_to_rownames("AgeBand") %>%
+  as.matrix()
+
+chisq.test(chisq_input)  # Inspect p-value in your console
+
+```
+
+# Education
+
+```{r}
+
+library(tidyverse)
+
+# ---- 1) Enter counts ----
+edu_counts <- tribble(
+  ~Cohort,              ~Education,          ~Count,
+  "Single",        "Below High School", 1141,
+  "Single",        "High School",       6276,
+  "Single",        "Some College", 1527,
+  "Single",        "Associate", 542,
+  "Single",        "Bachelor or Above", 669,
+  "Repeat", "Below High School", 40,
+  "Repeat", "High School",       282,
+  "Repeat", "Some College", 69,
+  "Repeat", "Associate", 26,
+  "Repeat", "Bachelor or Above", 24
+)
+
+# ---- 2) Compute totals and shares ----
+edu_shares <- edu_counts %>%
+  group_by(Cohort) %>%
+  mutate(Total = sum(Count),
+         Share = Count / Total) %>%
+  ungroup()
+
+# ---- Plot A: Side-by-side percentage bars by education level ----
+#edu_counts$Education<- factor(edu_counts$Education, levels = c("Below High School", "High School", "Above High School"))
+p_side <- ggplot(edu_shares, aes(x =fct_relevel(Education, "Below High School", "High School", "Some College", "Associate", "Bachelor or Above"), y = Share, fill = Cohort)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(aes(label = scales::percent(Share, accuracy = 0.1)),
+            position = position_dodge(width = 0.65),
+            vjust = -0.4, size = 2.5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, max(edu_shares$Share) * 1.15)) +
+  scale_fill_manual(values = c("Single" = "#1280bf",
+                               "Repeat" = "#09527d")) +
+  labs(
+    title = "Education Level Distribution by Cohort",
+#    subtitle = "Side-by-side comparison of percentage shares across education levels",
+    x = "Education Level",
+    y = "",
+    fill = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)+
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p_side)
+
+# ---- Plot B: Stacked composition by cohort (100% stacked) ----
+p_stack <- ggplot(edu_shares, aes(x = Cohort, y = Share, fill = Education)) +
+  geom_col(width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Education Composition (100% Stacked)",
+    subtitle = "Shares of education levels within Once Enroll vs Repeat Participant",
+    x = NULL, y = "Share of cohort", fill = "Education level"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_stack)
+
+# ---- Optional: Chi-square test to assess distribution differences ----
+contingency <- edu_counts %>%
+  pivot_wider(names_from = Cohort, values_from = Count) %>%
+  column_to_rownames("Education") %>%
+  as.matrix()
+
+chisq.test(contingency)  # Check p-value in console
+
+```
+
+
+# Barrier
+
+```{r}
+
+# Load libraries
+library(tidyverse)
+library(forcats)
+library(broom)
+
+# ---- 1) Enter the data (Single = once enroll; Repeat = repeat participant) ----
+barrier_counts <- tribble(
+  ~Cohort, ~Barrier,        ~Status,    ~Count,
+  "Single","Disabled",      "yes",      868,
+  "Single","Disabled",      "no",       8985,
+  "Single","Disabled",      "unknown",  662,
+  "Single","Low income",    "yes",      7325,
+  "Single","Low income",    "no",       3106,
+  "Single","Low income",    "unknown",  84,
+  "Single","Ex offender",   "yes",      788,
+  "Single","Ex offender",   "no",       9571,
+  "Single","Ex offender",   "unknown",  156,
+  "Single","Single Parent", "yes",      1651,
+  "Single","Single Parent", "no",       7662,
+  "Single","Single Parent", "unknown",  1202,
+  "Repeat","Disabled",      "yes",      34,
+  "Repeat","Disabled",      "no",       384,
+  "Repeat","Disabled",      "unknown",  23,
+  "Repeat","Low income",    "yes",      376,
+  "Repeat","Low income",    "no",       64,
+  "Repeat","Low income",    "unknown",  1,
+  "Repeat","Ex offender",   "yes",      41,
+  "Repeat","Ex offender",   "no",       396,
+  "Repeat","Ex offender",   "unknown",  4,
+  "Repeat","Single Parent", "yes",      107,
+  "Repeat","Single Parent", "no",       291,
+  "Repeat","Single Parent", "unknown",  43
+)
+
+# Fix label casing & factor order for readability
+barrier_counts <- barrier_counts %>%
+  mutate(
+    Barrier = fct_relevel(Barrier, "Low income", "Single Parent", "Disabled", "Ex offender"),
+    Status  = fct_relevel(Status, "yes", "no", "unknown")
+  )
+
+# ---- 2) Compute totals & shares ----
+barrier_shares <- barrier_counts %>%
+  group_by(Cohort, Barrier) %>%
+  mutate(BarrierTotal = sum(Count)) %>%          # total per cohort-barrier
+  ungroup() %>%
+  group_by(Cohort) %>%
+  mutate(CohortTotal = sum(Count[Status != "unknown"])) %>% # optional: cohort total excluding unknowns
+  ungroup() %>%
+  mutate(Share = Count / BarrierTotal)
+
+# YES rates per barrier & cohort
+yes_rates <- barrier_counts %>%
+  filter(Status == "yes") %>%
+  group_by(Cohort, Barrier) %>%
+  summarize(Yes = sum(Count), .groups = "drop") %>%
+  left_join(
+    barrier_counts %>%
+      filter(Status %in% c("yes", "no")) %>%     # exclude 'unknown' from rate denominator (common practice)
+      group_by(Cohort, Barrier) %>%
+      summarize(Den = sum(Count), .groups = "drop"),
+    by = c("Cohort", "Barrier")
+  ) %>%
+  mutate(YesRate = Yes / Den)
+
+# Unknown rates per barrier & cohort
+unknown_rates <- barrier_counts %>%
+  filter(Status == "unknown") %>%
+  group_by(Cohort, Barrier) %>%
+  summarize(Unknown = sum(Count), .groups = "drop") %>%
+  left_join(
+    barrier_counts %>%
+      group_by(Cohort, Barrier) %>%
+      summarize(Total = sum(Count), .groups = "drop"),
+    by = c("Cohort", "Barrier")
+  ) %>%
+  mutate(UnknownRate = Unknown / Total)
+
+# ---- 3) Plot A: YES rates by barrier (side-by-side) ----
+p_yes <- ggplot(yes_rates, aes(x = Barrier, y = YesRate, fill = Cohort)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(aes(label = scales::percent(YesRate, accuracy = 0.1)),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, max(yes_rates$YesRate) * 1.15)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  labs(
+    title = "Prevalence of Barriers (YES rate by cohort)",
+    subtitle = "Denominator excludes 'unknown' responses",
+    x = "Barrier", y = "Yes rate", fill = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_yes)
+
+# ---- 4) Plot B: 100% stacked bars (Yes/No/Unknown) faceted by barrier ----
+p_stack <- ggplot(barrier_shares, aes(x = Cohort, y = Share, fill = Status)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ Barrier, nrow = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("yes" = "#1280bf", "no" = "#95c6e8", "unknown" = "#d9e9f5")) +
+  labs(
+    title = "Response Composition by Barrier and Cohort",
+    subtitle = "100% stacked bars show proportions of Yes / No / Unknown",
+    x = NULL, y = "Share", fill = "Status"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+
+print(p_stack)
+
+# ---- 5) Plot C: Unknown rate by barrier (side-by-side) ----
+p_unknown <- ggplot(unknown_rates, aes(x = Barrier, y = UnknownRate, fill = Cohort)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(aes(label = scales::percent(UnknownRate, accuracy = 0.1)),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, max(unknown_rates$UnknownRate) * 1.15)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  labs(
+    title = "Unknown Response Rate by Barrier",
+    subtitle = "Higher 'unknown' can mask true prevalence and affect comparisons",
+    x = "Barrier", y = "Unknown rate", fill = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_unknown)
+
+# ---- 6) (Optional) Quick proportion tests: Repeat vs Single for 'Yes' ----
+prop_tests <- barrier_counts %>%
+  filter(Status %in% c("yes", "no")) %>%
+  group_by(Barrier, Cohort, Status) %>%
+  summarize(Count = sum(Count), .groups = "drop") %>%
+  pivot_wider(names_from = c(Cohort, Status), values_from = Count) %>%
+  mutate(
+    # For each barrier, test difference in proportions: Repeat_yes/Repeat_den vs Single_yes/Single_den
+    Repeat_den = Repeat_yes + Repeat_no,
+    Single_den = Single_yes + Single_no
+  ) %>%
+  rowwise() %>%
+  mutate(
+    ptest = list(broom::tidy(prop.test(
+      x = c(Repeat_yes, Single_yes),
+      n = c(Repeat_den, Single_den)
+    ))),
+    rr = (Repeat_yes / Repeat_den) / (Single_yes / Single_den)
+  ) %>%
+  unnest(ptest) %>%
+  select(Barrier, rr, estimate1, estimate2, p.value, conf.low, conf.high)
+
+print(prop_tests)
+# 'rr' is the risk ratio (Repeat vs Single); estimates are Repeat and Single Yes rates.
+# Use p.value to assess significance; conf.low/high are CI for difference in proportions.
+
+
+
+```
+
+
+Add pro_test into the plot
+
+```{r}
+library(tidyverse)
+library(forcats)
+library(broom)
+
+# ---- 1) Data (as in your earlier script) ----
+barrier_counts <- tribble(
+  ~Cohort, ~Barrier,        ~Status,    ~Count,
+  "Single","Disabled",      "yes",      868,
+  "Single","Disabled",      "no",       8985,
+  "Single","Disabled",      "unknown",  662,
+  "Single","Low income",    "yes",      7325,
+  "Single","Low income",    "no",       3106,
+  "Single","Low income",    "unknown",  84,
+  "Single","Ex offender",   "yes",      788,
+  "Single","Ex offender",   "no",       9571,
+  "Single","Ex offender",   "unknown",  156,
+  "Single","Single Parent", "yes",      1651,
+  "Single","Single Parent", "no",       7662,
+  "Single","Single Parent", "unknown",  1202,
+  "Repeat","Disabled",      "yes",      34,
+  "Repeat","Disabled",      "no",       384,
+  "Repeat","Disabled",      "unknown",  23,
+  "Repeat","Low income",    "yes",      376,
+  "Repeat","Low income",    "no",       64,
+  "Repeat","Low income",    "unknown",  1,
+  "Repeat","Ex offender",   "yes",      41,
+  "Repeat","Ex offender",   "no",       396,
+  "Repeat","Ex offender",   "unknown",  4,
+  "Repeat","Single Parent", "yes",      107,
+  "Repeat","Single Parent", "no",       291,
+  "Repeat","Single Parent", "unknown",  43
+) %>%
+  mutate(
+    Barrier = fct_relevel(Barrier, "Low income", "Single Parent", "Disabled", "Ex offender"),
+    Status  = fct_relevel(Status, "yes", "no", "unknown")
+  )
+
+# ---- 2) YES rates (exclude unknown from denominator) ----
+yes_rates <- barrier_counts %>%
+  filter(Status == "yes") %>%
+  group_by(Cohort, Barrier) %>%
+  summarize(Yes = sum(Count), .groups = "drop") %>%
+  left_join(
+    barrier_counts %>%
+      filter(Status %in% c("yes", "no")) %>%
+      group_by(Cohort, Barrier) %>%
+      summarize(Den = sum(Count), .groups = "drop"),
+    by = c("Cohort", "Barrier")
+  ) %>%
+  mutate(YesRate = Yes / Den)
+
+# ---- 3) Proportion tests (Repeat vs Single) + stars + y positions ----
+prop_counts <- barrier_counts %>%
+  filter(Status %in% c("yes", "no")) %>%
+  group_by(Barrier, Cohort, Status) %>%
+  summarize(n = sum(Count), .groups = "drop") %>%
+  pivot_wider(names_from = c(Cohort, Status), values_from = n)
+
+prop_tests <- prop_counts %>%
+  rowwise() %>%
+  mutate(
+    Repeat_den = Repeat_yes + Repeat_no,
+    Single_den = Single_yes + Single_no,
+    test = list(prop.test(x = c(Repeat_yes, Single_yes),
+                          n = c(Repeat_den, Single_den))),
+    p_value = test$p.value,
+    stars = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    repeat_rate = Repeat_yes / Repeat_den,
+    single_rate = Single_yes / Single_den,
+    # place star above the taller bar for each barrier
+    y_text = max(repeat_rate, single_rate) + 0.05
+  ) %>%
+  ungroup() %>%
+  select(Barrier, p_value, stars, y_text)
+
+# ---- 4) Plot A (from your earlier code) ----
+p_yes <- ggplot(yes_rates, aes(x = Barrier, y = YesRate, fill = Cohort)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(aes(label = scales::percent(YesRate, accuracy = 0.1)),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3.4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Single" = "#1280bf", "Repeat" = "#09527d")) +
+  labs(
+    title = "Prevalence of Barriers (YES rate by cohort)",
+    subtitle = "Denominator excludes 'unknown' responses",
+    x = "Barrier", y = "Yes rate", fill = "Cohort"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ---- 5) Add significance stars + adjust ylim so they are visible ----
+p_yes_annot <- p_yes +
+  geom_text(
+    data = prop_tests,
+    aes(x = Barrier, y = y_text, label = stars),
+    inherit.aes = FALSE,
+    size = 5,
+    fontface = "bold"
+  ) +
+  # ensure stars aren't clipped
+  coord_cartesian(ylim = c(0, max(prop_tests$y_text) + 0.02))
+
+print(p_yes_annot)
+# Compute short bracket segments per barrier (centered)
+brackets_df <- prop_tests %>%
+  mutate(
+    x = Barrier,         # center of the two dodged bars
+    xstart = as.numeric(Barrier) - 0.18,
+    xend   = as.numeric(Barrier) + 0.18,
+    yline  = y_text - 0.02
+  )
+
+p_yes_bracket <- p_yes_annot +
+  geom_segment(
+    data = brackets_df,
+    aes(x = xstart, xend = xend, y = yline, yend = yline),
+    inherit.aes = FALSE,
+    size = 0.6
+  )
+
+print(p_yes_bracket)
+prop_tests <- prop_tests %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )
+  )
+
+
+
+
+```
+
+```{r}
+ # ---- 1) Data ----
+ barrier_counts <- tribble(
+     ~Cohort, ~Barrier,        ~Status,    ~Count,
+     "Single","Low income",    "yes",      7325,
+     "Single","Low income",    "no",       3106,
+     "Single","Low income",    "unknown",  84,
+     "Single","Ex offender",   "yes",      788,
+     "Single","Ex offender",   "no",       9571,
+     "Single","Ex offender",   "unknown",  156,
+     "Single","Single Parent", "yes",      1651,
+     "Single","Single Parent", "no",       7662,
+     "Single","Single Parent", "unknown",  1202,
+     "Repeat","Low income",    "yes",      376,
+     "Repeat","Low income",    "no",       64,
+     "Repeat","Low income",    "unknown",  1,
+     "Repeat","Ex offender",   "yes",      41,
+     "Repeat","Ex offender",   "no",       396,
+     "Repeat","Ex offender",   "unknown",  4,
+     "Repeat","Single Parent", "yes",      107,
+     "Repeat","Single Parent", "no",       291,
+     "Repeat","Single Parent", "unknown",  43
+ ) %>%
+     mutate(
+         Barrier = fct_relevel(Barrier, "Low income", "Single Parent",  "Ex offender"),
+         Status  = fct_relevel(Status, "yes", "no", "unknown")
+     )
+ 
+ # ---- 2) YES & UNKNOWN rates (INCLUDING unknown in denominators) ----
+ rates_all <- barrier_counts %>%
+     group_by(Cohort, Barrier) %>%
+     summarize(
+         yes     = sum(Count[Status == "yes"]),
+         no      = sum(Count[Status == "no"]),
+         unknown = sum(Count[Status == "unknown"]),
+         den_all = yes + no + unknown,
+         yes_rate_all = yes / den_all,
+         unknown_rate_all = unknown / den_all,
+         .groups = "drop"
+     )
+ 
+ # ---- 3) Heatmap of YES rates (Barrier × Cohort), including unknown in denom ----
+ rates_heat <- rates_all %>%
+     group_by(Barrier) %>%
+     mutate(BarrierAvg = mean(yes_rate_all)) %>%
+     ungroup() %>%
+     mutate(
+         Barrier = fct_reorder(Barrier, BarrierAvg, .desc = TRUE),
+         label_color = if_else(yes_rate_all >= 0.50, "white", "black")
+     )
+ 
+ p_heat <- ggplot(rates_heat, aes(x = Cohort, y = Barrier, fill = yes_rate_all)) +
+     geom_tile(color = "white", size = 0.6) +
+     geom_text(aes(label = percent(yes_rate_all, accuracy = 0.1), color = label_color),
+               size = 4, fontface = "bold") +
+     scale_color_identity(guide = "none") +
+     scale_fill_gradient(low = "#d9e9f5", high = "#1280bf",
+                         limits = c(0, 1),
+                         labels = percent_format(accuracy = 1)) +
+     labs(
+         title = "Barrier Analysis by Cohort",
+ #        subtitle = "Denominator includes 'unknown' responses",
+         x = NULL, y = NULL,
+         fill = "YES rate"
+     ) +
+     theme_minimal(base_size = 12) +
+     theme(
+         plot.title = element_text(hjust = 0.5, face = "bold"),
+         axis.text.x = element_text(face = "bold"),
+         axis.text.y = element_text(face = "bold"),
+         legend.position = "none"
+     )
+ 
+ print(p_heat)
+ 
+ # ---- 4) Rates & Risk Ratios table (Repeat vs Single) ----
+ # Prop tests using full denominators (including unknown)
+ rr_table <- rates_all %>%
+     select(Cohort, Barrier, yes, den_all, yes_rate_all, unknown_rate_all) %>%
+     pivot_wider(names_from = Cohort, values_from = c(yes, den_all, yes_rate_all, unknown_rate_all),
+                 names_sep = "_") %>%
+     rowwise() %>%
+     mutate(
+         # Two-sample proportion test: Repeat vs Single
+         test = list(prop.test(x = c(yes_Repeat, yes_Single),
+                               n = c(den_all_Repeat, den_all_Single))),
+         p_value = test$p.value,
+         # Risk Ratio (Repeat / Single)
+         risk_ratio = yes_rate_all_Repeat / yes_rate_all_Single,
+         # 95% CI for each proportion (from prop.test)
+         ci_low_repeat  = test$conf.int[1],  # NOTE: prop.test CI is for difference, not each rate
+         ci_high_repeat = test$conf.int[2]
+     ) %>%
+     ungroup() %>%
+     transmute(
+         Barrier,
+         Single_YesRate  = percent(yes_rate_all_Single, accuracy = 0.1),
+         Repeat_YesRate  = percent(yes_rate_all_Repeat, accuracy = 0.1),
+         Risk_Ratio      = round(risk_ratio, 3),
+         p_value         = signif(p_value, 3),
+         Single_Unknown  = percent(unknown_rate_all_Single, accuracy = 0.1),
+         Repeat_Unknown  = percent(unknown_rate_all_Repeat, accuracy = 0.1),
+         Single_n        = den_all_Single,
+         Repeat_n        = den_all_Repeat
+     )
+ 
+ 
+ # If knitting to a report, you can use:
+ # knitr::kable(rr_table, align = c("l","r","r","r","r","r","r","r","r"))
+ knitr::kable(rr_table, align = c("l","r","r","r","r","r","r","r","r"))
+
+
+```
+
+
+## Correlation Analysis
+
+Once 
+```{r}
+
+# Install once if needed:
+# install.packages(c("tidyverse", "janitor", "ggcorrplot"))
+
+library(tidyverse)
+library(janitor)
+library(ggcorrplot)
+
+# 1) Select variables for correlation (excluding CIP for this plot)
+once_cor <- once_final %>%
+  select(Gender, Education, Hispanic, African, Ex_Offender, Low_income,
+         English_Learner, Single_Parent, Cross_Cultural, Disability,Wages)
+
+# 2) Make Education ordered (edit the levels to match your actual data!)
+if ("Education" %in% names(once_cor) && !is.numeric(once_cor$Education)) {
+  edu_levels <- c("Less than HS", "High School", "Some College", "Associate",
+                  "Bachelor", "Graduate")  # <-- adjust to match your data
+  # Only apply if these levels are present; otherwise skip
+  if (all(unique(na.omit(once_cor$Education)) %in% edu_levels)) {
+    once_cor$Education <- factor(once_cor$Education,
+                                 levels = edu_levels,
+                                 ordered = TRUE)
+    # Convert ordered factor to integer scale 1..K
+    once_cor$Education <- as.integer(once_cor$Education)
+  } else {
+    message("Education mapping skipped: levels in your data differ from edu_levels.")
+  }
+}
+
+# 3) Convert logicals and two-level factors to numeric 0/1
+to01_if_binary_factor <- function(x) {
+  if (is.factor(x) && nlevels(x) == 2) {
+    return(as.integer(x) - 1L) # maps first level to 0, second to 1
+  } else if (is.logical(x)) {
+    return(as.integer(x)) # TRUE=1, FALSE=0
+  } else {
+    return(x)
+  }
+}
+
+once_num <- once_cor %>%
+  mutate(across(everything(), to01_if_binary_factor)) %>%
+  # If any character columns slipped in, try to coerce to numeric quietly
+  mutate(across(where(is.character), ~ suppressWarnings(as.numeric(.x)))) %>%
+  # Keep only numeric columns for correlation
+  select(where(is.numeric)) %>%
+  clean_names()  # snake_case names (e.g., wages)
+
+# 4) Build correlation matrix using Spearman (robust for ordinal/binary)
+cor_mat <- cor(once_num, use = "pairwise.complete.obs", method = "spearman")
+
+# 5) Compute p-values for significance stars/blanks
+cor_pmat <- function(mat, method = "spearman") {
+  n <- ncol(mat)
+  p.mat <- matrix(NA_real_, n, n,
+                  dimnames = list(colnames(mat), colnames(mat)))
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      test <- suppressWarnings(cor.test(mat[, i], mat[, j], method = method))
+      p.mat[i, j] <- test$p.value
+    }
+  }
+  p.mat
+}
+p.mat <- cor_pmat(once_num)
+
+# 6) Plot the correlation heatmap
+ggcorrplot(
+  cor_mat,
+  hc.order = TRUE,          # hierarchical clustering for layout
+  type = "lower",
+  lab = TRUE,               # show correlation numbers
+  p.mat = p.mat,
+  sig.level = 0.05,         # blank non-significant cells
+  insig = "blank",
+  lab_size = 3,
+  colors = c("#2B8CBE", "white", "#D94801"),
+  title = "Correlation Heatmap – Workforce Indicators & Wages",
+  tl.cex = 10
+)
+
+# 7) Optional: focus on correlations with Wages (sorted bar chart)
+cor_wages <- sort(cor_mat[, "wages"], decreasing = TRUE)
+wages_df <- tibble(var = names(cor_wages),
+                   corr_with_wages = as.numeric(cor_wages)) %>%
+  filter(var != "wages")
+
+ggplot(wages_df,
+       aes(x = reorder(var, corr_with_wages), y = corr_with_wages,
+           fill = corr_with_wages > 0)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("#2B8CBE", "#D94801"),
+                    labels = c("Negative", "Positive"),
+                    name = "Direction") +
+  labs(title = "Single Participant Correlation with Wages (Spearman)",
+       x = NULL, y = "Correlation") +
+  theme_minimal(base_size = 12)+
+  theme(legend.position = "none")
+
+
+```
+
+# Pearson
+```{r}
+# Install once if needed:
+# install.packages(c("tidyverse", "ggcorrplot"))
+
+library(tidyverse)
+library(ggcorrplot)
+
+# 1) Start from your selection
+df <- once_final %>%
+  select(Gender, Education, Hispanic, African, Ex_Offender, Low_income,
+         English_Learner, Single_Parent, Cross_Cultural, CIP, Wages)
+
+# ---- Option: choose whether to include CIP via dummies ----
+include_cip <- FALSE   # set TRUE to include top CIP categories as dummies
+
+# 2) Convert Education to ordered numeric (adjust levels to match your data)
+df <- df %>%
+  mutate(
+    Education = case_when(
+      is.numeric(Education) ~ Education,
+      TRUE ~ as.numeric(factor(
+        Education,
+        levels = c("Less than HS", "High School", "Some College",
+                   "Associate", "Bachelor", "Graduate"),
+        ordered = TRUE
+      ))
+    )
+  )
+
+# 3) Convert binary factors/logicals/2-level characters to 0/1
+to01 <- function(x) {
+  if (is.factor(x) && nlevels(x) == 2) {
+    as.integer(x) - 1L
+  } else if (is.character(x)) {
+    ux <- unique(na.omit(x))
+    if (length(ux) == 2) as.integer(factor(x, levels = ux)) - 1L else x
+  } else if (is.logical(x)) {
+    as.integer(x)
+  } else x
+}
+
+df <- df %>%
+  mutate(across(
+    c(Gender, Hispanic, African, Ex_Offender, Low_income,
+      English_Learner, Single_Parent, Cross_Cultural),
+    to01
+  ))
+
+# 4) CIP handling
+if (!include_cip) {
+  df_num <- df %>% select(-CIP)
+} else {
+  # Keep the top K most frequent CIP categories; collapse the rest to "Other"
+  top_k <- 10
+  top_cips <- df %>%
+    count(CIP, sort = TRUE) %>%
+    slice_head(n = top_k) %>%
+    pull(CIP)
+
+  df_num <- df %>%
+    mutate(CIP = if_else(CIP %in% top_cips, CIP, "Other")) %>%
+    mutate(CIP = factor(CIP)) %>%
+    bind_cols(as_tibble(model.matrix(~ CIP - 1, .))) %>%
+    select(-CIP)
+}
+
+# 5) Keep numeric columns only
+df_num <- df_num %>% select(where(is.numeric))
+
+# 6) Pearson correlation matrix
+cor_mat <- cor(df_num, use = "pairwise.complete.obs", method = "pearson")
+
+# 7) p-values for each pair (for significance masking)
+cor_pmat <- function(dat, method = "pearson") {
+  n <- ncol(dat)
+  p <- matrix(NA_real_, n, n, dimnames = list(colnames(dat), colnames(dat)))
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      test <- suppressWarnings(cor.test(dat[, i], dat[, j], method = method))
+      p[i, j] <- test$p.value
+    }
+  }
+  p
+}
+p.mat <- cor_pmat(df_num)
+
+# 8) Plot heatmap (non-significant cells are blank)
+ggcorrplot(
+  cor_mat,
+  type = "lower",
+  hc.order = TRUE,     # cluster similar variables
+  lab = TRUE,          # numeric labels
+  p.mat = p.mat,
+  sig.level = 0.05,
+  insig = "blank",
+  lab_size = 3,
+  colors = c("#2B8CBE", "white", "#D94801"),
+  title = "Pearson Correlation – Workforce Characteristics & Wages"
+)
+
+# 9) Optional: sorted bar chart of correlations with Wages
+if ("Wages" %in% colnames(cor_mat)) {
+  cor_wages <- sort(cor_mat[, "Wages"], decreasing = TRUE)
+  wages_df <- tibble(var = names(cor_wages), corr_with_wages = as.numeric(cor_wages)) %>%
+    filter(var != "Wages")
+
+  ggplot(wages_df,
+         aes(x = reorder(var, corr_with_wages), y = corr_with_wages,
+             fill = corr_with_wages > 0)) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = c("#2B8CBE", "#D94801"),
+                      labels = c("Negative", "Positive"),
+                      name = "Direction") +
+    labs(title = "Pearson Correlation with Wages",
+         x = NULL, y = "Correlation") +
+    theme_minimal(base_size = 12)
+}
+
+
+```
+
+
+## Ananlysis the relationship between CIP and barrier
+```{r}
+# Install once if needed:
+# install.packages(c("tidyverse", "DescTools", "broom", "vcd", "nnet", "ggplot2", "ggpubr"))
+
+library(tidyverse)
+library(DescTools)
+library(broom)
+library(vcd)
+library(nnet)
+library(ggplot2)
+library(ggpubr)
+
+# --- Options: Unknown=9 handling & CIP collapsing ---
+treat_9_as_na <- TRUE     # set FALSE to keep "Unknown" as a category
+min_cip_n     <- 300     # collapse CIP levels with < min_cip_n cases into "Other"
+use_top_k     <- NA       # alternatively, set to an integer (e.g., 10) to keep top K CIP
+
+# --- 1) Select variables (adapt once_final) ---
+dat_single <- once_final %>%
+  select(CIP, Low_income, English_Learner, Cross_Cultural, Ex_Offender,
+         Age, Education, Single_Parent, Disability)
+
+dat_single$CIP<- substr(dat_single$CIP, 1,2)
+
+dat_single <- dat_single %>% filter(CIP != "99")
+
+dat_repeat <- repeat_final %>%
+  select(CIP, Low_income, English_Learner, Cross_Cultural, Ex_Offender,
+         Age, Education, Single_Parent, Disability)
+
+dat_repeat$CIP<- substr(dat_repeat$CIP, 1,2)
+
+dat_repeat <- dat_repeat %>% filter(CIP != "99")
+
+# --- 2) Helpers ---
+recode_9 <- function(x) ifelse(x == 9, NA, x)
+
+to_binary_factor <- function(x, labels = c("No", "Yes")) {
+  ux <- sort(unique(na.omit(x)))
+  if (length(ux) == 2 && all(ux %in% c(0, 1))) {
+    factor(x, levels = c(0, 1), labels = labels)
+  } else {
+    factor(x)
+  }
+}
+###########################################
+# --- 3) Clean variables ---
+dat_single<- dat_single %>%
+  mutate(CIP = factor(CIP),
+         Age = suppressWarnings(as.numeric(Age)),
+         Education = factor(Education, ordered = TRUE))  # label later if desired
+
+if (treat_9_as_na) {
+  dat_single <- dat_single %>%
+    mutate(Cross_Cultural = recode_9(Cross_Cultural),
+           Single_Parent  = recode_9(Single_Parent),
+           Disability = recode_9(Disability))
+}
+
+dat_single <- dat_single %>%
+  mutate(
+    Low_income      = to_binary_factor(Low_income),
+    English_Learner = to_binary_factor(English_Learner),
+    Cross_Cultural  = to_binary_factor(Cross_Cultural),
+    Ex_Offender     = to_binary_factor(Ex_Offender),
+    Single_Parent   = to_binary_factor(Single_Parent),
+    Disability      = to_binary_factor(Disability)
+  )
+
+# --- 4) Collapse rare CIP levels to reduce sparsity ---
+cip_counts_single <- dat_single %>% count(CIP, sort = TRUE)
+
+if (!is.na(use_top_k)) {
+  keep_levels <- cip_counts %>% slice_head(n = use_top_k) %>% pull(CIP)
+} else {
+  keep_levels <- cip_counts_single %>% filter(n >= min_cip_n) %>% pull(CIP)
+}
+dat_single <- dat_single %>%
+  mutate(CIP = if_else( CIP %in% keep_levels, as.character(CIP), "Other")) %>%
+  mutate(CIP2 = factor(CIP))
+
+# --- 5) CIP profiles: prevalence & lift ---
+binary_vars <- c("Low_income", "English_Learner", "Cross_Cultural",
+                 "Ex_Offender", "Single_Parent","Disability")
+
+overall_prev <- dat_single %>%
+  summarise(across(all_of(binary_vars), ~ mean(.x == "Yes", na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "overall_rate")
+
+cip_profiles_single <- dat_single %>%
+  pivot_longer(all_of(binary_vars), names_to = "variable", values_to = "value") %>%
+  mutate(value = fct_explicit_na(value, na_level = "Missing")) %>%
+  group_by(CIP, variable) %>%
+  summarise(
+    n = n(),
+    yes_rate = mean(value == "Yes", na.rm = TRUE),
+    missing_rate = mean(value == "Missing", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(overall_prev, by = "variable") %>%
+  mutate(lift = yes_rate / overall_rate)
+
+# Plot lift by CIP (higher = concentration)
+CIP_single <-ggplot(cip_profiles_single, aes(x = reorder(variable, lift), y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  labs(title = "Lift of Binary Characteristics by CIP Cluster",
+       x = NULL, y = "Lift (Cluster Yes Rate / Overall Yes Rate)") +
+  theme_minimal(base_size = 12)
+####################################
+# --- 3) Clean variables ---
+dat_repeat<- dat_repeat %>%
+  mutate(CIP = factor(CIP),
+         Age = suppressWarnings(as.numeric(Age)),
+         Education = factor(Education, ordered = TRUE))  # label later if desired
+
+if (treat_9_as_na) {
+  dat_repeat <- dat_repeat %>%
+    mutate(Cross_Cultural = recode_9(Cross_Cultural),
+           Single_Parent  = recode_9(Single_Parent),
+           Disability = recode_9(Disability))
+}
+
+dat_repeat <- dat_repeat %>%
+  mutate(
+    Low_income      = to_binary_factor(Low_income),
+    English_Learner = to_binary_factor(English_Learner),
+    Cross_Cultural  = to_binary_factor(Cross_Cultural),
+    Ex_Offender     = to_binary_factor(Ex_Offender),
+    Single_Parent   = to_binary_factor(Single_Parent),
+    Disability      = to_binary_factor(Disability)
+  )
+
+# --- 4) Collapse rare CIP levels to reduce sparsity ---
+cip_counts_repeat <- dat_repeat %>% count(CIP, sort = TRUE)
+
+if (!is.na(use_top_k)) {
+  keep_levels <- cip_counts %>% slice_head(n = use_top_k) %>% pull(CIP)
+} else {
+  keep_levels <- cip_counts_repeat %>% filter(n >= 20) %>% pull(CIP)
+}
+dat_repeat <- dat_repeat %>%
+  mutate(CIP = if_else( CIP %in% keep_levels, as.character(CIP), "Other")) %>%
+  mutate(CIP2 = factor(CIP))
+
+# --- 5) CIP profiles: prevalence & lift ---
+binary_vars <- c("Low_income", "English_Learner", "Cross_Cultural",
+                 "Ex_Offender", "Single_Parent","Disability")
+
+overall_prev_repeat <- dat_repeat %>%
+  summarise(across(all_of(binary_vars), ~ mean(.x == "Yes", na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "overall_rate")
+
+cip_profiles_repeat <- dat_repeat %>%
+  pivot_longer(all_of(binary_vars), names_to = "variable", values_to = "value") %>%
+  mutate(value = fct_explicit_na(value, na_level = "Missing")) %>%
+  group_by(CIP, variable) %>%
+  summarise(
+    n = n(),
+    yes_rate = mean(value == "Yes", na.rm = TRUE),
+    missing_rate = mean(value == "Missing", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(overall_prev_repeat, by = "variable") %>%
+  mutate(lift = yes_rate / overall_rate)
+
+# Plot lift by CIP (higher = concentration)
+CIP_repeat <-ggplot(cip_profiles_repeat, aes(x = reorder(variable, lift), y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  labs(title = "Lift of Binary Characteristics by CIP Cluster",
+       x = NULL, y = "Lift (Cluster Yes Rate / Overall Yes Rate)") +
+  theme_minimal(base_size = 12)
+```
+
+# put the two graph together
+
+```{r}
+# Required packages
+library(ggplot2)
+library(patchwork)
+
+# (Optional) Make CIP a factor with consistent order across both datasets
+# This ensures the legend order/labels are consistent.
+cip_levels <- c("11", "48", "49", "51", "52","Other")
+cip_labels <- c(
+  "11 – Computer and Information Sciences and Support Services",
+  "48 – Precision Production",
+  "49 – Transportation and Materials Moving",
+  "51 – Health Professions and Related Clinical Sciences",
+  "52 – Business, Management, Marketing, and Related Support Services",
+  "Other"
+)
+
+#If CIP is numeric, coerce to character before factoring
+cip_profiles_single$CIP <- factor(as.character(cip_profiles_single$CIP), levels = cip_levels, labels = cip_labels)
+cip_profiles_repeat$CIP <- factor(as.character(cip_profiles_repeat$CIP), levels = cip_levels, labels = cip_labels)
+
+# variable = c("Disability", "Low_income","Ex_Offender","English_Learner","Single_Parent","Cross_Cultural")
+
+my_color<- c( "11 – Computer and Information Sciences and Support Services"="#FCB134",
+              "48 – Precision Production" = "#e4701d",
+              "49 – Transportation and Materials Moving" ="#c1d72d",
+              "51 – Health Professions and Related Clinical Sciences"="#6fb43f",
+              "52 – Business, Management, Marketing, and Related Support Services"="#8ad4df",
+              "Other" = "#4eb3d1")
+
+# Build the two plots (reusing your structure) and standardize legend scale
+CIP_single <- ggplot(cip_profiles_single, aes(x = reorder(variable, lift), y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  labs(
+    title = NULL,  # remove individual plot titles; we'll add one combined title later
+    x = NULL,
+    y = "Single"
+  ) +
+  scale_fill_manual(values = my_color, name = "CIP") +
+  theme_minimal(base_size = 12)
+
+CIP_repeat <- ggplot(cip_profiles_repeat, aes(x = reorder(variable,lift), y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Repeat"
+  ) +
+  scale_fill_manual(values = my_color, name = "CIP") +
+  theme_minimal(base_size = 12)
+
+# Combine side-by-side with shared legend and a single overall title
+combined_plot <- (CIP_single + CIP_repeat) +
+  plot_layout(guides = "collect") +         # share legend across plots
+  plot_annotation(title = "Training programs vs. Barriers Analysis",
+                  caption = "Instruction: \n
+                             1.0 = same as overall population.\n
+                             >1.0 = over-represented.\n
+                             <1.0 = under-represented.\n
+                             Example: Disability in CIP 48 (Single) and Ex-Offender in CIP 49 (Repeat) show over-representation.") &
+  theme(
+    legend.position = "bottom",             # place legend under the plots
+    legend.box = "horizontal",
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.caption.position = "plot",
+    plot.caption = element_text(hjust = 0, face = "italic", color = "darkgray")
+  )
+
+# If you want the legend to wrap into two rows (useful if labels are long), add:
+combined_plot <- combined_plot & guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# Print
+combined_plot
+
+###############
+
+# Wrap legend so patchwork can use it
+legend_wrapped <- wrap_elements(full = legend_obj)
+
+# Wrap caption text
+caption_wrapped <- wrap_elements(
+  full = grid::textGrob(
+    "1.0 = same as overall population\n
+     >1.0 = over-represented\n
+     <1.0 = under-represented\n
+     Example: Disability in CIP 48 (Single) and Ex-Offender in CIP 49 (Repeat) show over-representation.",
+    x = 0.02, y = 0.95, hjust = 0, vjust = 1,
+    gp = grid::gpar(fontsize = 9, col = "gray30", fontface = "italic")
+  )
+)
+
+
+# Extract legend from combined plot
+legend_obj <- get_legend(
+  CIP_single + 
+    theme(
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.title = element_text(size = 7),
+      legend.text = element_text(size = 6)
+    )
+)
+
+# Create caption panel
+caption_panel <- wrap_elements(
+  full = grid::textGrob(
+    "1.0 = same as overall population\n
+     >1.0 = over-represented\n
+     <1.0 = under-represented\n
+     Example: Disability in CIP 48 (Single) and Ex-Offender in CIP 49 (Repeat) show over-representation.",
+    x = 0.02, y = 0.95, hjust = 0, vjust = 1,
+    gp = grid::gpar(fontsize = 9, col = "gray30", fontface = "italic")
+  )
+)
+
+# Combine legend (left) and caption (right) into row 2
+legend_caption_row <- legend_obj + caption_panel + plot_layout(widths = c(1, 1))
+
+# FINAL: two rows (main plot on top, legend+caption on bottom)
+final_plot <- 
+  (CIP_single + CIP_repeat) +
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "none")  # remove legends inside top plots
+
+final_output <- final_plot / legend_caption_row +
+  plot_annotation(
+    title = "Training Programs vs. Barriers Analysis"
+  ) &
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+final_output
+
+
+caption_plot <- ggplot() +
+  theme_void() +
+  annotate("text",
+           x = 0, y = 1,
+           hjust = 0, vjust = 1,
+           label = "Instruction: \n
+                   1.0 = same as overall population\n
+                   >1.0 = over-represented\n
+                   <1.0 = under-represented\n
+                   Example: Disability in CIP 48 (Single) and Ex-Offender in CIP 49 (Repeat) show over-representation.",
+           color = "gray60", fontface = "italic", size = 3)
+
+
+```
+
+
+###fix
+
+
+```{r}
+# Required packages
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+cip_profiles_single <- tribble(
+     ~CIP, ~variable, ~n, ~yes_rate, ~missing_rate, ~overal_rate, ~lift,
+     "11", "Cross Cultural", 687, 0, 0.199417758, 0.003793524, 0,
+     "11", "Disability", 687, 0.094614265, 0.087336245, 0.084959094, 1.1136449,
+     "11", "English Learner", 687, 0, 0, 0.002352664, 0,
+     "11", "Ex Offender", 687, 0.029112082, 0.016011645, 0.079990449, 0.3639445,
+     "11", "Low Income", 687, 0.576419214, 0.00727802, 0.705631298, 0.8168844,
+     "11", "Single Parent", 687, 0.08588064, 0.173216885, 0.18849967, 0.455601,
+     
+     "48", "Cross Cultural", 367, 0.002724796, 0.054495913, 0.003793524, 0.7182756,
+     "48", "Disability", 367, 0.242506812, 0.0626703, 0.084959094, 2.854395,
+     "48", "English Learner", 367, 0, 0, 0.002352664, 0,
+     "48", "Ex Offender", 367, 0.122615804, 0.016348774, 0.079990449, 1.5328806,
+     "48", "Low Income", 367, 0.828337875, 0.002724796, 0.705631298, 1.1738962,
+     "48", "Single Parent", 367, 0.035422343, 0.029972752, 0.18849967, 0.1879173,
+     
+     "49", "Cross Cultural", 3042, 0.004930966, 0.142669297, 0.003793524, 1.299838,
+     "49", "Disability", 3042, 0.046679816, 0.060486522, 0.084959094, 0.5494387,
+     "49", "English Learner", 3042, 0.002629849, 0, 0.002352664, 1.1178172,
+     "49", "Ex Offender", 3042, 0.15877712, 0.008218277, 0.079990449, 1.984951,
+     "49", "Low Income", 3042, 0.705456936, 0.006903353, 0.705631298, 0.9997529,
+     "49", "Single Parent", 3042, 0.101577909, 0.130834977, 0.18849967, 0.5388758,
+     
+     "51", "Cross Cultural", 2908, 0.002751032, 0.10866575, 0.003793524, 0.7251916,
+     "51", "Disability", 2908, 0.049174691, 0.060522696, 0.084959094, 0.5788043,
+     "51", "English Learner", 2908, 0.002407153, 0, 0.002352664, 1.0231602,
+     "51", "Ex Offender", 2908, 0.012035763, 0.0065337, 0.079990449, 0.150465,
+     "51", "Low Income", 2908, 0.721458047, 0.003094911, 0.705631298, 1.0224292,
+     "51", "Single Parent", 2908, 0.296767538, 0.086657497, 0.18849967, 1.5743664,
+     
+     "52", "Cross Cultural", 370, 0, 0.194594595, 0.003793524, 0,
+     "52", "Disability", 370, 0.110810811, 0.091891892, 0.084959094, 1.3042843,
+     "52", "English Learner", 370, 0.002702703, 0, 0.002352664, 1.1487838,
+     "52", "Ex Offender", 370, 0.07027027, 0.054054054, 0.079990449, 0.8784833,
+     "52", "Low Income", 370, 0.567567568, 0.027027027, 0.705631298, 0.8043401,
+     "52", "Single Parent", 370, 0.110810811, 0.156756757, 0.18849967, 0.5878568,
+     
+     "Other", "Cross Cultural", 1127, 0.003549246, 0.125110914, 0.003793524, 0.9356065,
+     "Other", "Disability", 1127, 0.173025732, 0.070097604, 0.084959094, 2.0365769,
+     "Other", "English Learner", 1127, 0.003549246, 0, 0.002352664, 1.5086069,
+     "Other", "Ex Offender", 1127, 0.054125998, 0.039041704, 0.079990449, 0.6766558,
+     "Other", "Low Income", 1127, 0.708074534, 0.017746229, 0.705631298, 1.0034625,
+     "Other", "Single Parent", 1127, 0.125110914, 0.086956522, 0.18849967, 0.6637195
+ )
+
+ cip_profiles_repeat <- tribble(
+     ~CIP, ~variable, ~n, ~yes_rate, ~missing_rate, ~overal_rate, ~lift,
+     
+     "11", "Cross Cultural", 26, 0, 0.30769231, 0.006269592, 0,
+     "11", "Disability", 26, 0.076923077, 0.07692308, 0.086309524, 0.89124668,
+     "11", "English Learner", 26, 0, 0, 0.005602241, 0,
+     "11", "Ex Offender", 26, 0, 0, 0.092436975, 0,
+     "11", "Low Income", 26, 0.615384615, 0, 0.854341737, 0.72030265,
+     "11", "Single Parent", 26, 0.038461538, 0.30769231, 0.271028037, 0.14190981,
+     
+     "49", "Cross Cultural", 109, 0.018348624, 0.08256881, 0.006269592, 2.9266055,
+     "49", "Disability", 109, 0.082568807, 0.0733945, 0.086309524, 0.95665929,
+     "49", "English Learner", 109, 0.018348624, 0, 0.005602241, 3.27522936,
+     "49", "Ex Offender", 109, 0.247706422, 0, 0.092436975, 2.67973311,
+     "49", "Low Income", 109, 0.844036697, 0, 0.854341737, 0.98793804,
+     "49", "Single Parent", 109, 0.19266055, 0.08256881, 0.271028037, 0.710851,
+     
+     "51", "Cross Cultural", 142, 0, 0.1056338, 0.006269592, 0,
+     "51", "Disability", 142, 0.049295775, 0.02816901, 0.086309524, 0.57115104,
+     "51", "English Learner", 142, 0, 0, 0.005602241, 0,
+     "51", "Ex Offender", 142, 0.007042254, 0, 0.092436975, 0.07618438,
+     "51", "Low Income", 142, 0.915492958, 0, 0.854341737, 1.071577,
+     "51", "Single Parent", 142, 0.373239437, 0.0915493, 0.271028037, 1.37712482,
+     
+     "Other", "Cross Cultural", 80, 0, 0.075, 0.006269592, 0,
+     "Other", "Disability", 80, 0.1375, 0.0875, 0.086309524, 1.59310345,
+     "Other", "English Learner", 80, 0, 0, 0.005602241, 0,
+     "Other", "Ex Offender", 80, 0.0625, 0, 0.092436975, 0.67613636,
+     "Other", "Low Income", 80, 0.8375, 0, 0.854341737, 0.98028689,
+     "Other", "Single Parent", 80, 0.15, 0.075, 0.271028037, 0.55344828
+ )
+
+# 1) CIP labels including "Other"
+cip_levels <- c("11", "48", "49", "51", "52", "Other")
+cip_labels <- c(
+  "11 – Computer and Information Sciences and Support Services",
+  "48 – Precision Production",
+  "49 – Transportation and Materials Moving",
+  "51 – Health Professions and Related Clinical Sciences",
+  "52 – Business, Management, Marketing, and Related Support Services",
+  "Other"
+)
+
+# If CIP is numeric, coerce to character before factoring
+cip_profiles_single$CIP <- factor(as.character(cip_profiles_single$CIP),
+                                  levels = cip_levels, labels = cip_labels)
+cip_profiles_repeat$CIP <- factor(as.character(cip_profiles_repeat$CIP),
+                                  levels = cip_levels, labels = cip_labels)
+
+# 2) Build a single, shared order for 'variable' across BOTH datasets
+#    - Use the union of variables present in either dataset
+#    - Order by average lift across both (you can change to alphabetical if preferred)
+var_levels <- bind_rows(
+  cip_profiles_single %>% select(variable, lift),
+  cip_profiles_repeat %>% select(variable, lift)
+) %>%
+  group_by(variable) %>%
+  summarize(mean_lift = mean(lift, na.rm = TRUE), .groups = "drop") %>%
+  arrange(mean_lift) %>%               # ascending; after flip lowest will appear at the top
+  pull(variable)
+
+my_color<- c( "11 – Computer and Information Sciences and Support Services"="#FCB134",
+              "48 – Precision Production" = "#e4701d",
+              "49 – Transportation and Materials Moving" ="#c1d72d",
+              "51 – Health Professions and Related Clinical Sciences"="#6fb43f",
+              "52 – Business, Management, Marketing, and Related Support Services"="#8ad4df",
+              "Other" = "#4eb3d1")
+
+# Apply the common factor levels to both datasets
+cip_profiles_single <- cip_profiles_single %>%
+  mutate(variable = factor(variable, levels = var_levels))
+cip_profiles_repeat <- cip_profiles_repeat %>%
+  mutate(variable = factor(variable, levels = var_levels))
+
+# 3) Compute shared numeric axis (Impact) limits so comparisons are on the same scale
+impact_max <- max(c(cip_profiles_single$lift, cip_profiles_repeat$lift), na.rm = TRUE)
+
+# 4) Build the two plots WITHOUT per-panel reordering
+CIP_single <- ggplot(cip_profiles_single, aes(x = variable, y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  geom_hline(yintercept = 1, color = "red", linewidth = 1, linetype = "dashed") +  # highlight line
+  scale_x_discrete(drop = FALSE) +  # keep categories even if absent in this panel
+  scale_y_continuous(limits = c(0, impact_max), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = my_color, name = "CIP") +
+  labs(
+    title = NULL,  # we'll set a combined title later
+    x = NULL,      # shared category axis appears on the left after flip
+    y = "Single"   # rename numeric axis from "Lift..." to "Impact"
+  ) +
+  theme_minimal(base_size = 12)
+
+CIP_repeat <- ggplot(cip_profiles_repeat, aes(x = variable, y = lift, fill = CIP)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  geom_hline(yintercept = 1, color = "red", linewidth = 1, linetype = "dashed") +  # highlight line
+  coord_flip() +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(limits = c(0, impact_max), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = my_color, name = "CIP") +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Repeat"
+  ) +
+  theme_minimal(base_size = 12) +
+  # Hide duplicate category labels/ticks on the right to emphasize shared axis on the left
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "none")
+
+# 5) Combine side-by-side with shared legend and a single overall title
+combined_plot <- (CIP_single + CIP_repeat) +
+  plot_layout(guides = "collect") +         # share legend across plots
+  plot_annotation(title = "Training Programs vs. Barriers") &
+   theme(
+    legend.position = "none",             # place legend under the plots
+    legend.box = "horizontal",
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+    ) 
+legend <- get_legend(CIP_single)
+
+# If the legend is long, wrap into two rows (optional)
+ combined_plot <- combined_plot & guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+# Print
+
+combined_plot/legend
+
+
+```
+
+
+
+```{r}
+
+# Age & Education distribution by CIP
+p_age <- ggplot(dat2, aes(x = CIP, y = Age, fill = CIP)) +
+  geom_violin(trim = TRUE) + geom_boxplot(width = 0.15, outlier.alpha = 0.2) +
+  labs(title = "Age Distribution by CIP", x = NULL, y = "Age") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p_edu <- dat2 %>%
+  mutate(Education = fct_explicit_na(Education, na_level = "Missing")) %>%
+  ggplot(aes(x = CIP, fill = Education)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Education Mix by CIP", x = NULL, y = "Share") +
+  theme_minimal(base_size = 12)
+
+ggarrange(p_age, p_edu, ncol = 2)
+```
+## Program Successful Analysis
+
+```{r}
+# Packages
+library(tidyverse)
+library(broom)
+library(lme4)        # mixed-effects GLMM
+library(splines)     # restricted cubic splines
+library(ggeffects)   # marginal effects / predicted probabilities
+library(pROC)        # ROC/AUC
+library(patchwork)   # combine plots
+library(car)         # VIF
+
+# Inspect
+str(once_succ)
+```
+
+
+```{r}
+# Recode basics (adjust labels as needed)
+df <- once_succ %>%
+  mutate(
+    Gender = factor(Gender, levels = c(1, 2), labels = c("Male", "Female")),
+    Employment_Entry = factor(Employment_Entry, levels = c(0, 1), labels = c("No", "Yes")),
+    Low_income = factor(Low_income, levels = c(0, 1), labels = c("No", "Yes")),
+    Credential = factor(Credential, levels = c(0, 1), labels = c("No", "Yes")),
+    Employed = factor(round(Employed), levels = c(0, 1), labels = c("No", "Yes")), # ensure binary
+    Education = ordered(Education),   # treat as ordinal (if codes reflect levels)
+    County = factor(County)           # many counties; useful for random intercept
+  )
+
+
+#####Descriptive & Bivariate Checks
+
+# Bivariate tests (illustrative)
+# Categorical vs outcome: Chi-squared
+chisq.test(table(df$Credential, df$Low_income))
+chisq.test(table(df$Employed,   df$Employment_Entry))
+
+# Continuous vs outcome: t-test or Wilcoxon
+t.test(Length ~ Credential, data = df)
+t.test(Length ~ Employed,   data = df)
+
+
+```
+
+# Logistic Models
+```{r}
+
+# Model A: Credential (GLM with logit, splines for Age/Length)
+m_cred <- glm(
+  Credential ~ Gender + Employment_Entry + ns(Age, df = 4) +
+    Education  + Low_income + ns(Length, df = 4),
+  data = df, family = binomial()
+)
+
+# Model B: Employed (exclude Credential per your spec)
+m_empl <- glm(
+  Employed ~ Gender + Employment_Entry + ns(Age, df = 4) +
+    Education +  Low_income + ns(Length, df = 4),
+  data = df, family = binomial()
+)
+
+# (Optional) Model C: Employed with Credential included
+m_empl_cred <- glm(
+  Employed ~ Credential + Gender + Employment_Entry + ns(Age, df = 4) +
+    Education + Low_income + ns(Length, df = 4),
+  data = df, family = binomial()
+)
+
+summary(m_cred)
+summary(m_empl)
+summary(m_empl_cred)
+
+# Check multicollinearity (GLMs; VIF ignores splines so interpret cautiously)
+car::vif(m_cred)
+car::vif(m_empl)
+
+
+```
+
+## County Random Intercept
+
+
+```{r}
+
+# Mixed-effects GLMMs
+glmm_cred <- glmer(
+  Credential ~ Gender + Employment_Entry + ns(Age, 4) + Education +
+    Low_income + ns(Length, 4) + (1 | County),
+  data = df, family = binomial(), control = glmerControl(optimizer = "bobyqa")
+)
+
+glmm_empl <- glmer(
+  Employed ~ Gender + Employment_Entry + ns(Age, 4) + Education +
+    Low_income + ns(Length, 4) + (1 | County),
+  data = df, family = binomial(), control = glmerControl(optimizer = "bobyqa")
+)
+
+#summary(glmm_cred)
+#summary(glmm_empl)
+
+```
+
+Model Quality
+```{r}
+# AUC for GLMs
+pred_cred <- predict(m_cred, type = "response")
+pred_empl <- predict(m_empl, type = "response")
+
+roc_cred <- pROC::roc(m_cred$y, pred_cred)
+roc_empl <- pROC::roc(m_empl$y, pred_empl)
+
+pROC::auc(roc_cred)
+pROC::auc(roc_empl)
+
+
+# Simple calibration plot function
+cal_plot <- function(outcome, pred, title){
+  tibble(outcome = as.numeric(outcome) - 1, pred = pred) %>%
+    mutate(bin = ntile(pred, 10)) %>%
+    group_by(bin) %>%
+    summarize(mean_pred = mean(pred), mean_obs = mean(outcome), n = n()) %>%
+    ggplot(aes(x = mean_pred, y = mean_obs)) +
+    geom_point() + geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey40") +
+    labs(x = "Predicted probability", y = "Observed rate", title = title) +
+    theme_minimal()
+}
+
+p_cal_cred <- cal_plot(m_cred$y, pred_cred, "Calibration: Credential")
+p_cal_empl <- cal_plot(m_empl$y,   pred_empl, "Calibration: Employed")
+p_cal_cred + p_cal_empl
+
+
+```
+graphs
+```{r}
+# Tidy, exponentiate (OR), and plot for Model A and Model B
+plot_or <- function(model, title){
+  coefs <- broom::tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(term = str_replace(term, "ns\\(Age, df = 4\\).*", "Age (spline)"),
+           term = str_replace(term, "ns\\(Length, df = 4\\).*", "Length (spline)"))
+  
+  ggplot(coefs, aes(x = reorder(term, estimate), y = estimate)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+    coord_flip() +
+    labs(x = NULL, y = "Odds Ratio (logit)", title = title) +
+    theme_minimal()
+}
+
+p_or_cred <- plot_or(m_cred, "Predictors of Earning a Credential")
+p_or_empl <- plot_or(m_empl, "Predictors of Post‑Program Employment")
+p_or_cred + p_or_empl
+
+```
+
+
+```{r}
+
+# Credential vs Length (by Low_income)
+ge_cred_len <- ggeffects::ggpredict(m_cred, terms = c("Length [quantile]", "Low_income")) 
+p_me_cred_len <- plot(ge_cred_len) + labs(title = "Predicted Credential vs Length by Low Income")
+
+# Employed vs Age (by Employment_Entry)
+ge_empl_age <- ggeffects::ggpredict(m_empl, terms = c("Age [quantile]", "Employment_Entry"))
+p_me_empl_age <- plot(ge_empl_age) + labs(title = "Predicted Employment vs Age by Entry Employment")
+
+p_me_cred_len + p_me_empl_age
+```
+
+
+```{r}
+library(ggeffects)
+library(ggplot2)
+library(dplyr)
+
+# 1) Get predictions with CIP on x and Credential as grouping
+ge_empl_cred <- ggeffects::ggpredict(m_empl_cred, terms = c("CIP", "Credential"))
+
+# 2) Convert to a tidy data frame
+df_ge <- as.data.frame(ge_empl_cred) %>%
+  mutate(
+    CIP = x,
+    Credential = factor(group, levels = c("No", "Yes"))  # ensure 2 levels in order
+  )
+
+# 3) Optional: keep only the top N most common CIPs to avoid a very crowded plot
+top_cips <- once_succ %>%
+  count(CIP, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  pull(CIP)
+
+df_ge <- df_ge %>% filter(CIP %in% top_cips)
+
+# 4) Plot: CIP on y (flipped), predicted probability on x, color by Credential (2 colors)
+ggplot(df_ge, aes(x = predicted, y = CIP, color = Credential)) +
+  geom_point(position = position_dodge(width = 0.25), size = 2) +
+  geom_errorbar(aes(xmin = conf.low, xmax = conf.high),
+                position = position_dodge(width = 0.25), width = 0.3) +
+  labs(
+    title = "Adjusted Employment Probability by Credential and CIP",
+    x = "Predicted Employment Probability",
+    y = "CIP",
+    color = "Credential"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+
+## Model 2
+
+
+```{r}
+# Install packages if needed:
+# install.packages(c("dplyr", "ggplot2", "broom", "lme4", "emmeans"))
+
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(lme4)
+library(emmeans)    # for marginal probabilities and contrasts
+once_succ$Employment_Entry <- ifelse(once_succ$Employment_Entry >=1, 1,0)
+repeat_succ$Employment_Entry <- ifelse(repeat_succ$Employment_Entry >=1, 1,0)
+once_succ$Low_income <- ifelse(is.na(once_succ$Low_income), 9, once_succ$Low_income)
+repeat_succ$Low_income <- ifelse(is.na(repeat_succ$Low_income), 9, repeat_succ$Low_income)
+
+# 1) Bind cohorts and clean types
+df <- dplyr::bind_rows(
+  once_succ %>% mutate(cohort = "Single"),
+  repeat_succ %>% mutate(cohort = "Repeat")
+) %>%
+  mutate(
+    # ensure binary indicators are 0/1 ints
+    Employed          = as.integer(Employed > 0),
+    Credential        = as.integer(Credential > 0),
+    Employment_Entry  = as.integer(Employment_Entry > 0),
+   
+
+    # factors and labels (adjust if your coding differs)
+    Low_income        = factor(Low_income , levels = c(0,1,9), labels = c("No","Yes", "Unknown")),
+    Gender   = factor(Gender, levels = c(1, 2,9), labels = c("Male", "Female","Unknown")),
+    Education = factor(Education),  # treat as categorical unless you prefer ordered
+    County   = factor(County),
+    cohort   = factor(cohort, levels = c("Single", "Repeat"))
+  )
+
+# Quick sanity check
+dplyr::glimpse(df)
+
+
+```
+Balanced
+```{r}
+# Simple baseline summary
+baseline <- df %>%
+  group_by(cohort) %>%
+  summarise(
+    n = n(),
+    age_mean = mean(Age, na.rm = TRUE),
+    age_sd   = sd(Age, na.rm = TRUE),
+    entry_pct = mean(Employment_Entry == 1, na.rm = TRUE),
+    length_median = median(Length, na.rm = TRUE)
+  )
+baseline
+
+# SMD helper functions
+smd_cont <- function(x, grp) {
+  m1 <- mean(x[grp == "Single"], na.rm = TRUE)
+  m2 <- mean(x[grp == "Repeat"], na.rm = TRUE)
+  s1 <- sd(x[grp == "Single"], na.rm = TRUE)
+  s2 <- sd(x[grp == "Repeat"], na.rm = TRUE)
+  (m1 - m2) / sqrt((s1^2 + s2^2) / 2)
+}
+
+smd_bin <- function(x, grp) {
+  p1 <- mean(x[grp == "Single"] == 1, na.rm = TRUE)
+  p2 <- mean(x[grp == "Repeat"] == 1, na.rm = TRUE)
+  (p1 - p2) / sqrt((p1*(1-p1) + p2*(1-p2)) / 2)
+}
+
+smds <- tibble::tibble(
+  variable = c("Age", "Length",  "Employment_Entry"),
+  SMD = c(
+    smd_cont(df$Age, df$cohort),
+    smd_cont(df$Length, df$cohort),
+    smd_bin(df$Employment_Entry, df$cohort)
+  )
+)
+smds
+
+```
+
+outcome comparison
+
+```{r}
+ci_prop <- function(x, grp, label) {
+  single_success <- sum(x[grp == "Single"] == 1, na.rm = TRUE)
+  single_total   <- sum(!is.na(x[grp == "Single"]))
+  repeat_success <- sum(x[grp == "Repeat"] == 1, na.rm = TRUE)
+  repeat_total   <- sum(!is.na(x[grp == "Repeat"]))
+
+  single_ci <- prop.test(single_success, single_total, conf.level = 0.90)$conf.int
+  repeat_ci <- prop.test(repeat_success, repeat_total, conf.level = 0.90)$conf.int
+
+  out <- data.frame(
+    cohort = c("Single", "Repeat"),
+    success = c(single_success, repeat_success),
+    total   = c(single_total, repeat_total),
+    rate    = c(single_success/single_total, repeat_success/repeat_total),
+    ci_low  = c(single_ci[1], repeat_ci[1]),
+    ci_high = c(single_ci[2], repeat_ci[2]),
+    outcome = label
+  )
+
+  # Add RR and RD rows (for convenience)
+  RR <- out$rate[2] / out$rate[1]
+  RD <- out$rate[2] - out$rate[1]
+  attr(out, "RR") <- RR
+  attr(out, "RD") <- RD
+  out
+}
+
+employed <- ci_prop(df$Employed, df$cohort, "Employed")
+credential <- ci_prop(df$Credential, df$cohort, "Credential")
+
+employed
+attr(employed, "RR"); attr(employed, "RD")
+
+credential
+attr(credential, "RR"); attr(credential, "RD")
+
+```
+plot
+```{r}
+employed <-  data.frame(
+  cohort  = c("Single", "Repeat"),
+  success = c(8899, 369),
+  total   = c(9496, 436),
+  rate    = c(0.9371314, 0.8463303),
+  ci_low  = c(0.9328543, 0.8145681),
+  ci_high = c(0.9411563, 0.8736493),
+  outcome = "Employed"
+)
+
+
+credential <- data.frame(
+  cohort  = c("Single", "Repeat"),
+  success = c(6459, 217),
+  total   = c(9496, 436),
+  rate    = c(0.6801811, 0.4977064),
+  ci_low  = c(0.6722051, 0.4573163),
+  ci_high = c(0.6880538, 0.5381256),
+  outcome = "Credential"
+)
+
+
+plot_outcome <- function(tbl) {
+  ggplot(tbl, aes(x = cohort, y = rate)) +
+    geom_point(size = 3, color = "#1280bf") +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.08, color = "#f6851f") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+      title = paste0("Outcome: ", unique(tbl$outcome)),
+      y = "Rate (with 95% CI)",
+      x = NULL
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+
+ggplot(employed, aes(x = cohort, y = rate)) +
+  geom_point(size = 5, color = "#1280bf") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 0.15,
+                linewidth = 1,
+                color = "#f6851f") +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0.80, 0.96)   # << reduces blank space
+  ) +
+  labs(
+    title = "WIOA Performance: Employed Within a Year",
+    y = "Employment Rate (90% CI)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+#   axis.text.x = element_text(face = "bold"),
+    axis.text.y = element_text(size = 8)
+  ) +
+  geom_text(
+    aes(label = scales::percent(rate, accuracy = 0.1)),
+    vjust = -1,
+    size = 4.5,
+    color = "#1280bf"
+  )
+
+
+plot_outcome(employed)
+plot_outcome(credential)
+```
+# Format the two plot
+
+```{r}
+
+plot_outcome <- function(tbl, col = "#1280bf", ylim = NULL) {
+  p <- ggplot(tbl, aes(x = cohort, y = rate)) +
+    geom_point(size = 3, color = col) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.3, linewidth = 1, color = "#f6851f") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+      title = NULL,                   # shared title will be added via patchwork
+      y = NULL,                       # we'll control y label per-panel below
+      x = NULL
+    ) +
+    theme_minimal(base_size = 12)
+  
+#   if (!is.null(ylim)) {
+#     p <- p + coord_cartesian(ylim = ylim)
+#   }
+#   p
+ }
+
+
+# Common y-limit so both panels use the same scale
+common_ylim <- c(0, max(c(employed$ci_high, credential$ci_high), na.rm = TRUE))
+
+# Build panels (left shows y label, right hides it)
+p1 <- plot_outcome(employed,   col = "#1280bf", ylim = common_ylim) + labs(y = "Rate (with 95% CI)", x= "Employment Status After Exited")
+p2 <- plot_outcome(credential, col = "#1280bf", ylim = common_ylim) + labs(y = NULL, x= "Credential")
+
+# Combine with shared title
+(p1 | p2) +
+  plot_annotation(title = "WIOA Performance Outcomes") &
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+
+Adjusted Comparisons(Mixed - Effects Logistic)
+
+```{r}
+
+# Mixed-effects logistic regression
+mod_emp <- glmer(
+  Employed ~ cohort + Gender + Age + Education + Low_income + Employment_Entry + Length + (1 | County),
+  data = df,
+  family = binomial()
+)
+
+mod_cred <- glmer(
+  Credential ~ cohort + Gender + Age + Education + Low_income + Employment_Entry + Length + (1 | County),
+  data = df,
+  family = binomial()
+)
+
+# # Adjusted odds ratios (AOR) for the "cohortRepeat" term
+# broom::tidy(mod_emp, conf.int = TRUE, exponentiate = TRUE)
+# broom::tidy(mod_cred, conf.int = TRUE, exponentiate = TRUE)
+```
+Adjusted Predicted probability
+
+```{r}
+# Marginal (population-level) predicted probabilities by cohort
+emm_emp <- emmeans(mod_emp, ~ cohort, type = "response")
+emm_cred <- emmeans(mod_cred, ~ cohort, type = "response")
+
+emm_emp
+pairs(emm_emp, type = "response")   # risk difference & ratio for Employed
+
+emm_cred
+
+
+```
+## 5) Propensity Score (PS) Weighting
+ 
+```{r}
+ # PS model (logistic) for cohort assignment
+ps_mod <- glm(cohort ~ Gender + Age + Education + Low_income + Employment_Entry + Length + County,data = df, family = binomial())
+
+df <- df %>%
+  mutate(
+    ps = as.numeric(ps_mod$fitted.values),
+    w  = ifelse(cohort == "Repeat", 1/ps, 1/(1-ps))
+  )
+
+# Check weight stability
+summary(df$w); quantile(df$w, probs = c(.01, .99), na.rm = TRUE)
+
+# Optional: trim extreme weights (e.g., at 1st and 99th percentiles)
+q <- quantile(df$w, probs = c(.01, .99), na.rm = TRUE)
+df_trim <- df %>% filter(w >= q[1], w <= q[2])
+
+# Weighted logistic regressions (cohort only, since weighting accounts for confounding)
+mod_emp_w <- glm(Employed ~ cohort, data = df_trim, weights = w, family = binomial())
+mod_cred_w <- glm(Credential ~ cohort, data = df_trim, weights = w, family = binomial())
+
+#broom::tidy(mod_emp_w, conf.int = TRUE, exponentiate = TRUE)
+#broom::tidy(mod_cred_w, conf.int = TRUE, exponentiate = TRUE)
+
+# Weighted marginal probabilities via emmeans
+emm_emp_w <- emmeans(mod_emp_w, ~ cohort, type = "response", weights = "w")
+emm_cred_w <- emmeans(mod_cred_w, ~ cohort, type = "response", weights = "w")
+
+emm_emp_w; pairs(emm_emp_w, type = "response")
+emm_cred_w; pairs(emm_cred_w, type = "response")
+ 
+```
+
+
+#Visuals: Adjusted Outcomes
+
+```{r}
+
+# Plot adjusted marginal probabilities from mixed-effects model
+plot_emmeans <- function(emm, title) {
+  df_ <- as.data.frame(emm)
+  ggplot(df_, aes(x = cohort, y = prob)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.08) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(title = title, y = "Adjusted probability (95% CI)", x = NULL) +
+    theme_minimal(base_size = 12)
+}
+
+plot_emmeans(emm_emp, "Adjusted Employment Probability by Cohort")
+plot_emmeans(emm_cred, "Adjusted Credential Probability by Cohort")
+
+
+```
+
+
+# Sensitivity & Subgroup Analyses
+
+
+```{r}
+# Interaction with Gender
+mod_emp_int <- glmer(
+  Employed ~ cohort * Gender + Age + Education + Low_income + Employment_Entry + Length + (1 | County),
+  data = df, family = binomial()
+)
+
+emmeans(mod_emp_int, ~ cohort | Gender, type = "response")
+pairs(emmeans(mod_emp_int, ~ cohort | Gender, type = "response"))
+
+# Similarly for Low_income or Education
+
+
+
+```
+
+
+```{python}
+items = ["Vase", "Statue", "Mask"]
+for index, item in enumerate(items, start=1):
+    print(f"Exhibit {index}: {item} - Ancient Greece")
+
+```
