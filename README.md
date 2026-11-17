@@ -171,9 +171,10 @@ The approach provides a framework for transforming operational data into actiona
 ## Repository Contents
 
 ```text
-/Analysis
-/Documentation
-/Visualizations
+/figures
+/doc
+/scipt
+/Data
 README.md
 ```
 
