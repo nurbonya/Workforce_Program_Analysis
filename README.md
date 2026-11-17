@@ -1,60 +1,199 @@
 ![Image1](project_banner.jpeg)
 
-# WIOA Repeat Participant Analysis Project
+# Workforce Program Analysis
 
-## Overview
-This project analyzes differences between Single and Repeat participants in Missouri’s Workforce Innovation and Opportunity Act (WIOA) Title I training programs. The analysis examines how participant characteristics, training patterns, socioeconomic barriers, and instructional program pathways relate to employment and credential outcomes.  
+## Project Overview
 
-The goal is to provide **data-driven insights** that strengthen workforce services and improve training and employment opportunities statewide.
+This project analyzes Workforce Innovation and Opportunity Act (WIOA) participant data to identify factors associated with repeat participation in workforce programs.
 
-📄 **Full Research Report:**  
-`data/raw/Research Report.docx`
+The objective was to determine how participant characteristics, service utilization patterns, and program outcomes differed between first-time and repeat participants. The analysis was designed to support evidence-based decision-making and identify opportunities to improve service delivery strategies.
 
 ---
 
-## Key Research Questions
-- How do participant characteristics differ between Single-enrollment and Repeat-enrollment cohorts?  
-- What barriers (low income, single parent, ex-offender, etc.) appear more often among Repeat participants?  
-- How do employment and credential outcomes compare across participant groups?  
-- Which training programs (CIP codes) show the strongest concentration of barriers?  
-- How have training enrollments shifted across PY2018–PY2025?
+## Business Problem
 
----
+Workforce development programs often serve participants with varying needs, employment barriers, and service histories.
 
-## Key Insights
-- Repeat participants tend to be **younger** and face **higher concentrations of barriers**.  
-- Employment and credential attainment outcomes are **lower among Repeat participants**.  
-- CIP 48 (Precision Production) and CIP 49 (Transportation & Materials Moving) show **higher-than-average barrier concentrations**.  
-- Enrollment trends display a decline after PY2019, stabilizing in recent years.  
+Program staff wanted to better understand:
 
-These findings highlight where targeted supports, flexible training structures, and enhanced case management may improve participant outcomes.
+- Which characteristics are associated with repeat participation
+- Whether repeat participants demonstrate different outcomes than first-time participants
+- How service delivery strategies could be tailored to participant needs
+- What insights historical program data can provide for future planning
+
+The findings help workforce professionals move beyond a one-size-fits-all approach and support more customized participant services.
 
 ---
 
 ## Data Sources
-- **PIRL Records (PY2018–PY2024)**  
-- **Local Area Unemployment Statistics (LAUS)**  
-- WIOA Title I Adult, Dislocated Worker, and Youth Programs  
-- Wagner-Peyser co-enrollment data  
+
+The analysis used historical workforce program data containing participant demographics, service utilization records, and program outcomes.
+
+Data elements analyzed included:
+
+- Participant demographics
+- Education levels
+- Employment status
+- Barriers to employment
+- Program participation history
+- Services received
+- Program outcomes
+
+To protect confidentiality, all publicly shared materials use aggregate results and anonymized examples.
 
 ---
 
-## Methods
-This project uses a combination of:  
-- Descriptive statistics  
-- Longitudinal trend analysis  
-- **Generalized Linear Mixed Models (GLMMs)** for outcome prediction  
-- Natural spline terms for nonlinear relationships (e.g., age, program length)  
-- County-level random intercepts using LAUS data  
+## Analytical Approach
 
-This modeling approach accounts for demographic, programmatic, and geographic variation.
+The analysis followed a structured workflow:
+
+1. Data cleaning and preparation
+2. Historical trend analysis
+3. Participant segmentation
+4. First-time vs. repeat participant comparisons
+5. Outcome evaluation
+6. Identification of service-delivery patterns
+7. Development of recommendations
+
+Methods included:
+
+- Descriptive statistics
+- Comparative analysis
+- Trend analysis
+- Workforce program evaluation
+- Data visualization
+
+---
+
+## Analysis Workflow
+
+```text
+Raw Workforce Data
+          │
+          ▼
+Data Cleaning & Validation
+          │
+          ▼
+Participant Classification
+(First-Time vs Repeat)
+          │
+          ▼
+Exploratory Analysis
+          │
+          ▼
+Trend Evaluation
+          │
+          ▼
+Outcome Comparisons
+          │
+          ▼
+Key Findings & Recommendations
+```
+
+---
+
+## Key Findings
+
+The analysis identified measurable differences between repeat and first-time participants.
+
+Examples explored included:
+
+- Demographic characteristics
+- Employment history patterns
+- Service utilization behavior
+- Program completion outcomes
+- Barriers to employment
+
+The results suggested that participant groups may benefit from different engagement and service strategies.
+
+---
+
+## Recommendations
+
+Based on the analysis, several recommendations were developed:
+
+- Use participant history to support service planning.
+- Consider customized service pathways for repeat participants.
+- Identify participant groups that may benefit from additional support resources.
+- Incorporate historical participation patterns into operational planning.
+- Continue monitoring participant outcomes through ongoing reporting and analysis.
+
+---
+
+## Technologies Used
+
+- Python
+- SQL
+- Pandas
+- NumPy
+- Jupyter Notebook
+- Data Visualization Libraries
 
 ---
 
 ## Skills Demonstrated
-- Workforce development analytics  
-- Statistical modeling (GLMM + splines)  
-- R programming (tidyverse, lme4)  
-- Data visualization  
-- Report writing and interpretation  
-- Portfolio-quality documentation 
+
+### Data Analysis
+- Exploratory Data Analysis (EDA)
+- Statistical Analysis
+- Trend Analysis
+- Workforce Analytics
+
+### Data Management
+- Data Cleaning
+- Data Validation
+- Data Preparation
+- SQL Querying
+
+### Business Intelligence
+- Program Evaluation
+- Stakeholder Reporting
+- Decision Support
+- Data-Driven Recommendations
+
+---
+
+## Business Impact
+
+This project demonstrates how workforce program data can be used to support:
+
+- Program evaluation
+- Service-delivery improvement
+- Participant segmentation
+- Strategic planning
+- Workforce policy discussions
+- Evidence-based decision-making
+
+The approach provides a framework for transforming operational data into actionable insights for workforce program administrators and stakeholders.
+
+---
+
+## Repository Contents
+
+```text
+/Analysis
+/Documentation
+/Visualizations
+README.md
+```
+
+---
+
+## Data Privacy Notice
+
+This repository contains anonymized and publicly shareable project materials.
+
+To protect confidential information:
+
+- No participant-level production data is included.
+- Sensitive information has been removed or generalized.
+- Results are presented at an aggregate level.
+- Documentation focuses on methodology and analytical approach.
+
+---
+
+## Author
+
+Nan Urbonya
+
+Data Analyst specializing in Workforce Analytics, Business Intelligence, SQL, Tableau, and Python.
